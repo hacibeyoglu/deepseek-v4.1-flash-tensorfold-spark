@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from lib.config import (StackError, load_recipe, plan, read_json, runtime_id,
                         synthetic_cluster, validate_recipe)
 from lib.cluster import Cluster, setup
-from lib import sources
+from lib import processes, sources
 
 def parser():
     ap = argparse.ArgumentParser(description=__doc__)
@@ -169,6 +169,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    processes.install_signals()
     try: sys.exit(main())
     except (StackError, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print(f"stack: {exc}", file=sys.stderr)

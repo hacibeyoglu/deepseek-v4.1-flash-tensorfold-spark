@@ -71,6 +71,9 @@ over SSH to the worker's first matched fabric address, preserving snapshot links
 and revisions are retained. Transfers use checksums, partial-file reuse, and atomic replacement. The worker
 verifies SHA256 hashes offline before writing its download receipt. Repeating the command reuses cached data;
 checksum scans still read the selected files on disk.
+All rsync stages show filenames, aggregate transfer progress (bytes, percentage, speed, and time estimates),
+and final statistics, with line-buffered output. Checksum scanning and subsequent SHA256 verification are
+separate from transfer progress and can take time even when the cache is already populated.
 
 `./stack build` builds the runtime image on the head and streams `docker save` into worker `docker load`.
 `./stack prepare` pulls the pinned preparation image on the head and distributes it the same way. Matching
@@ -130,6 +133,13 @@ Both ranks use `unless-stopped`. Stop disables restart on both before draining. 
 launched ranks and retains their data. Restart saves a rollback receipt; rollback is explicit. Operations are locked.
 Successful readiness checks both ranks, API model identity, health, and actual generation. Maximum context,
 concurrency, modalities, and performance need separate qualification.
+
+Downloads run in the foreground. Press Ctrl+C once to cancel: the launcher waits for its downloader and
+transfer processes to stop, escalating to a forced stop if needed, then exits with status 130. Further Ctrl+C
+presses during cleanup are ignored so children can be reaped and locks released. Completed cache files and
+partial transfers remain for the next run; interrupted work does not produce a new success receipt.
+Worker agents also cancel their child processes when the parent SSH connection closes. A broken or unreachable
+worker is still reported as unknown; connection loss alone does not prove that remote work has stopped.
 
 ## License
 

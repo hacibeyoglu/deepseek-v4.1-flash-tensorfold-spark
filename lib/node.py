@@ -12,10 +12,16 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
+
+try:
+    from . import processes
+except ImportError:  # Standalone script or embedded SSH agent, before checkout sync.
+    import processes
 
 
 def run(argv, *, cwd=None, env=None, capture=False, input=None, check=True, timeout=None):
-    result = subprocess.run(argv, cwd=cwd, env=None if env is None else {**os.environ, **env},
+    result = processes.run(argv, cwd=cwd, env=None if env is None else {**os.environ, **env},
                             input=input, text=True, stdout=subprocess.PIPE if capture else sys.stderr,
                             stderr=subprocess.PIPE if capture else None, timeout=timeout)
     if check and result.returncode:
@@ -141,12 +147,11 @@ def download(request):
     if check.returncode or check.stdout.strip() != version:
         run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", f"huggingface_hub=={version}"])
     spec = {"cache": node["hub_cache"], "model": recipe["model"], "engram": recipe["engram"]}
-    proc = subprocess.Popen([str(python), str(Path(node["root"]) / "lib/hub.py")],
+    proc = processes.run([str(python), str(Path(node["root"]) / "lib/hub.py")],
                             env={**os.environ, "HF_HOME": node["hf_home"], "HF_HUB_CACHE": node["hub_cache"]},
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    stdout, _ = proc.communicate(json.dumps(spec))
+                            input=json.dumps(spec), stdout=subprocess.PIPE, text=True)
     if proc.returncode: raise RuntimeError("Checkpoint download/verification failed; see output above")
-    verified = json.loads(stdout)
+    verified = json.loads(proc.stdout)
     from lib.config import atomic_json
     atomic_json(Path(node["root"]) / ".stack/download.json", verified)
     return verified
@@ -295,8 +300,19 @@ def main(request):
 
 
 if __name__ == "__main__":
+    processes.install_signals()
+    done = threading.Event()
     try:
-        request = json.load(sys.stdin)
+        request = json.loads(sys.stdin.readline())
+        if request.get("watch_parent"):
+            def watch_parent():
+                # EOF means the head/SSH connection is gone. Cancel this agent's owned work.
+                while os.read(sys.stdin.fileno(), 1):
+                    pass
+                if not done.is_set():
+                    import signal
+                    os.kill(os.getpid(), signal.SIGTERM)
+            threading.Thread(target=watch_parent, daemon=True).start()
         lock = None
         if request["action"] in ("download", "prepare", "run", "cache-prepare", "cache-verify"):
             lock_path = Path(request["root"]) / ".stack/node.lock"
@@ -305,7 +321,13 @@ if __name__ == "__main__":
             try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise RuntimeError("A previous operation is still running on this node") from exc
-        print(json.dumps({"ok": True, "result": main(request)}))
+        result = main(request)
+        done.set()
+        print(json.dumps({"ok": True, "result": result}))
+    except KeyboardInterrupt:
+        done.set()
+        sys.exit(130)
     except Exception as exc:
+        done.set()
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
         sys.exit(1)

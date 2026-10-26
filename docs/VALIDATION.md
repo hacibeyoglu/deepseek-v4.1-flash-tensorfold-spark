@@ -35,6 +35,14 @@ only the head downloads weights and pulls the preparation image, and that copied
 No production weights/images were downloaded or transferred, and no Spark service was started for this change.
 Live fabric throughput and a fresh deployment remain unqualified. Earlier 43-test results above predate this change.
 
+Cancellation handling subsequently passed **62 local tests**, shell checks, and the isolated two-node dry-run
+on 2026-10-26. Eight additional tests use real local subprocesses and pipes, including a simulated Hub client
+through the actual download wrapper: repeated Ctrl+C, a child ignoring SIGTERM, parent death/connection EOF,
+the embedded worker bootstrap without a checkout, parallel-call cancellation, and image-pipeline interruption
+and failure. They verify bounded shutdown, child exit, reusable node locks, retained partial files, and absence
+of an interrupted download receipt. These checks use no SSH, Docker, model downloads, or GPU workloads;
+live Hugging Face/Xet cancellation and network-failure behavior on the Sparks remain unqualified.
+
 ```bash
 ./scripts/test.sh
 ./stack run flash17-exl3-2.8bpw --setup --dry-run -n 192.0.2.11,192.0.2.12

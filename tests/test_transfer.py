@@ -151,25 +151,23 @@ class OrchestrationTransferTests(unittest.TestCase):
     def test_image_skips_identical_and_streams_missing_over_fabric(self):
         self.c.remotes[0].call.return_value = {'id': 'sha256:expected'}
         self.c.remotes[1].call.return_value = {'id': 'sha256:expected'}
-        with patch('lib.cluster.subprocess.Popen') as save:
+        with patch('lib.cluster.processes.pipeline') as save:
             self.c.sync_image('runtime:tag', self.target)
             save.assert_not_called()
         self.c.remotes[1].call.side_effect = [None, {'id': 'sha256:expected'}]
-        with patch('lib.cluster.subprocess.Popen') as save, patch('lib.cluster.subprocess.run') as load:
-            save.return_value.wait.return_value = 0
-            load.return_value.returncode = 0
+        with patch('lib.cluster.processes.pipeline') as transfer:
             self.c.sync_image('registry/asset@sha256:digest', self.target)
-            self.assertEqual(save.call_args.args[0], ['docker', 'save', 'sha256:expected'])
-            self.assertEqual(load.call_args.args[0][-2:], [self.target, 'docker load'])
+            self.assertEqual(transfer.call_args.args[0], ['docker', 'save', 'sha256:expected'])
+            self.assertEqual(transfer.call_args.args[1][-2:], [self.target, 'docker load'])
             self.assertEqual(self.c.remotes[1].call.call_args.kwargs['image'], 'sha256:expected')
 
     def test_image_transfer_failure_and_mismatch_fail(self):
         self.c.remotes[0].call.return_value = {'id': 'sha256:expected'}
-        for save_status, load_status, final_id in ((1, 0, 'expected'), (0, 1, 'expected'), (0, 0, 'wrong')):
+        for failed, final_id in ((True, 'expected'), (False, 'wrong')):
             self.c.remotes[1].call.side_effect = [None, {'id': 'sha256:' + final_id}]
-            with patch('lib.cluster.subprocess.Popen') as save, patch('lib.cluster.subprocess.run') as load:
-                save.return_value.wait.return_value = save_status
-                load.return_value.returncode = load_status
+            with patch('lib.cluster.processes.pipeline') as transfer:
+                if failed:
+                    transfer.side_effect = subprocess.CalledProcessError(1, ['docker', 'save'])
                 with self.assertRaises(StackError):
                     self.c.sync_image('runtime:tag', self.target)
 

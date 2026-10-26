@@ -11,30 +11,37 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 
 from .config import (StackError, atomic_json, choose_network, digest, plan, read_json,
                      safe_path, ssh_target, validate_cluster)
-from . import cache_sync, sources
+from . import cache_sync, processes, sources
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
        "-o", "ServerAliveCountMax=3"]
+RSYNC = ["rsync", "-av", "--protect-args", "--human-readable", "--info=progress2", "--stats", "--outbuf=L"]
 
 
 class Remote:
     def __init__(self, root, node):
         self.root, self.node = Path(root), node
 
-    def call(self, action, **kwargs):
-        payload = {"action": action, "root": self.node.get("root"), **kwargs}
+    def call(self, action, _cancel=None, **kwargs):
+        payload = {"action": action, "root": self.node.get("root"), "watch_parent": True, **kwargs}
         if self.node.get("target"):
             script = base64.b64encode((self.root / "lib/node.py").read_bytes()).decode()
-            code = f"import base64; exec(compile(base64.b64decode('{script}'), 'stack-worker', 'exec'))"
+            helpers = base64.b64encode((self.root / "lib/processes.py").read_bytes()).decode()
+            code = ("import base64,sys,types; m=types.ModuleType('processes'); "
+                    f"exec(compile(base64.b64decode('{helpers}'), 'stack-processes', 'exec'), m.__dict__); "
+                    "sys.modules['processes']=m; "
+                    f"exec(compile(base64.b64decode('{script}'), 'stack-worker', 'exec'))")
             command = [*SSH, ssh_target(self.node["target"]), shlex.join(["python3", "-c", code])]
         else:
             command = [sys.executable, str(self.root / "lib/node.py")]
-        proc = subprocess.run(command, input=json.dumps(payload), text=True, stdout=subprocess.PIPE)
+        proc = processes.run(command, input=json.dumps(payload) + "\n", text=True, stdout=subprocess.PIPE,
+                             keep_stdin=True, cancel=_cancel, grace=6)
         try: response = json.loads(proc.stdout)
         except ValueError as exc:
             raise StackError(f"{self.node.get('target') or 'head'}: worker state is unknown (SSH/agent failed)") from exc
@@ -109,14 +116,22 @@ class Cluster:
 
     def pair(self, action, requests=None):
         # Read both results, including failures. Never reinterpret an unreachable worker as absent.
+        cancel = threading.Event()
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            jobs = [pool.submit(r.call, action, **((requests or [{}, {}])[i])) for i, r in enumerate(self.remotes)]
-            results, failures = [], []
-            for i, future in enumerate(jobs):
-                try: results.append(future.result())
-                except Exception as exc:
-                    failures.append(f"rank {i}: {exc}")
-                    results.append(None)
+            try:
+                jobs = [pool.submit(r.call, action, _cancel=cancel, **((requests or [{}, {}])[i]))
+                        for i, r in enumerate(self.remotes)]
+                results, failures = [], []
+                for i, future in enumerate(jobs):
+                    try: results.append(future.result())
+                    except Exception as exc:
+                        failures.append(f"rank {i}: {exc}")
+                        results.append(None)
+            except BaseException:
+                with processes.cleaning_up():
+                    cancel.set()
+                    pool.shutdown(wait=True, cancel_futures=True)
+                raise
         if failures: raise StackError("; ".join(failures))
         return results
 
@@ -128,7 +143,7 @@ class Cluster:
     def sync_code(self):
         peer = self.nodes[1]
         self.remotes[1].call("claim", stack=self.config["id"])
-        args = ["rsync", "-a", "--protect-args", "--exclude=.stack", "--exclude=.git", "--exclude=cluster.json*",
+        args = [*RSYNC, "--exclude=.stack", "--exclude=.git", "--exclude=cluster.json*",
                 "--exclude=__pycache__", "--exclude=.venv", "-e", shlex.join(SSH),
                 str(self.root) + "/", peer["target"] + ":" + peer["root"] + "/"]
         sources.run(args)
@@ -137,7 +152,7 @@ class Cluster:
         peer = self.nodes[1]
         dest = str(Path(peer["root"]) / relative)
         self.remotes[1].call("run", argv=["mkdir", "-p", dest])
-        sources.run(["rsync", "-a", "--protect-args", "--exclude=.git", "--exclude=.zig-cache", "--exclude=zig-out",
+        sources.run([*RSYNC, "--exclude=.git", "--exclude=.zig-cache", "--exclude=zig-out",
                      "--exclude=__pycache__", "-e", shlex.join(SSH),
                      str(self.root / relative) + "/", peer["target"] + ":" + dest + "/"])
 
@@ -149,15 +164,17 @@ class Cluster:
         entries = cache_sync.manifest(self.nodes[0]["hub_cache"], self.recipe, head)
         peer = self.nodes[1]
         self.remotes[1].call("cache-prepare", cache=peer["hub_cache"], entries=entries)
+        print("Syncing weights to worker; checksum scans may take time before transfer progress advances.", flush=True)
         # Explicit NUL-delimited paths preserve snapshot links and copy only their required blobs.
         # No HF_HOME, credentials, other revisions, deletion, or in-place blob writes.
         with tempfile.TemporaryFile() as listing:
             listing.write(b"".join(e["path"].encode() + b"\0" for e in entries))
             listing.seek(0)
-            sources.run(["rsync", "-a", "--protect-args", "--checksum", "--partial-dir=.rsync-partial",
+            sources.run([*RSYNC, "--checksum", "--partial-dir=.rsync-partial",
                          "--no-whole-file", "--from0", "--files-from=-", "-e", shlex.join(SSH),
                          self.nodes[0]["hub_cache"] + "/", target + ":" + peer["hub_cache"] + "/"],
                         stdin=listing)
+        print("Verifying copied weights on worker (SHA256)...", flush=True)
         worker = self.remotes[1].call("cache-verify", cache=peer["hub_cache"], entries=entries, receipt=head)
         return [head, worker]
 
@@ -185,14 +202,10 @@ class Cluster:
         peer = self.remotes[1].call("image", image=reference, missing_ok=True)
         if peer is None or peer["id"] != local["id"]:
             saved = local["id"] if "@sha256:" in image else image
-            writer = subprocess.Popen(["docker", "save", saved], stdout=subprocess.PIPE)
             try:
-                reader = subprocess.run([*SSH, target, "docker load"], stdin=writer.stdout)
-            finally:
-                writer.stdout.close()
-                code = writer.wait()
-            if reader.returncode or code:
-                raise StackError("Image transfer failed")
+                processes.pipeline(["docker", "save", saved], [*SSH, target, "docker load"])
+            except subprocess.CalledProcessError as exc:
+                raise StackError("Image transfer failed") from exc
         peer = self.remotes[1].call("image", image=reference)
         if peer["id"] != local["id"]:
             raise StackError("Image IDs differ after transfer")

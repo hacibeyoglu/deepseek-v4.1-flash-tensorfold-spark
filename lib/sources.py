@@ -9,11 +9,12 @@ import tarfile
 import tempfile
 
 from .config import StackError, atomic_json, read_json, runtime_id
+from . import processes
 
 
 def run(args, **kwargs):
     print("+ " + " ".join(str(x) for x in args), flush=True)
-    subprocess.run(args, check=True, **kwargs)
+    processes.run(args, check=True, **kwargs)
 
 
 def tree_hash(root):

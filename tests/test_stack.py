@@ -173,7 +173,7 @@ class FakeRemote:
         self.state = {"state": "absent"}
         self.fail_action = None
         self.image = "sha256:same"
-    def call(self, action, **kwargs):
+    def call(self, action, _cancel=None, **kwargs):
         self.events.append((self.rank, action, copy.deepcopy(kwargs)))
         if action == self.fail_action: raise StackError("worker unreachable")
         if action == "state": return copy.deepcopy(self.state)
@@ -390,7 +390,7 @@ class FilesTests(unittest.TestCase):
 
     def test_missing_worker_response_is_unknown_not_absent(self):
         remote = Remote(ROOT, {"target": "test-worker", "root": "/example"})
-        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 255, stdout="")):
+        with patch("lib.cluster.processes.run", return_value=subprocess.CompletedProcess([], 255, stdout="")):
             with self.assertRaisesRegex(StackError, "unknown"): remote.call("state", name="test", stack="a")
 
 
