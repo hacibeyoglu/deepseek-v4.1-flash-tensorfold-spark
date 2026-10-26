@@ -32,7 +32,7 @@ def export(root, spec, destination, cache=None):
     if cache is None:
         if not git.exists():
             git.mkdir(parents=True)
-            run(["git", "init", "--bare", str(git)])
+            run(["git", "init", "--bare", "--initial-branch=main", str(git)])
         exists = subprocess.run(["git", "-C", str(git), "cat-file", "-e", spec["commit"] + "^{commit}"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         if not exists:
