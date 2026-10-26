@@ -18,7 +18,7 @@ Clone this repository on the head. Both nodes need ARM64/GB10, Docker with NVIDI
 Python 3.12+ with `venv`, Git, `patch`, rsync, and node-local `HF_TOKEN`. The head needs passwordless SSH to the worker.
 
 ```bash
-git clone https://github.com/hacibeyoglu/deepseek-v4.1-flash-tensorfold-spark.git deepseek-v4.1-flash-tensorfold-spark
+git clone https://github.com/hacibeyoglu/deepseek-v4.1-flash-tensorfold-spark.git
 cd deepseek-v4.1-flash-tensorfold-spark
 ./stack setup --worker worker-host     # Once: discover nodes and save cluster.json
 ./stack doctor
