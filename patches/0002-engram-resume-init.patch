@@ -1,0 +1,16 @@
+diff --git a/engine/zig/zig/src/families/deepseek_v41/batch.zig b/engine/zig/zig/src/families/deepseek_v41/batch.zig
+index 8de7135..b32b995 100644
+--- a/engine/zig/zig/src/families/deepseek_v41/batch.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/batch.zig
+@@ -643,9 +643,9 @@ pub const Batch = struct {
+         f.gated = false;
+         const h = f.engram orelse return;
+         if (b.stages.items.len == 0) return;
+-        // the table opens on the forward's first Engram window (a prompt always comes first); never index rows instead
+-        if (std.c.getenv("TF_DSV41_ENGRAM_DIR") != null and f.engram_rows == null) return error.EngramNotOpen;
++        // An SSD-restored slot can decode before a prompt window has opened the table.
+         const src: ?eh.Source = try f.engramSource(h); // the gate's locked table while it lives
++        if (std.c.getenv("TF_DSV41_ENGRAM_DIR") != null and f.engram_rows == null) return error.EngramNotOpen;
+         const n = rowtab.totalRows(mix);
+         const dim: usize = f.cfg.engram_head_dim;
+         // TF_DSV41_ENGRAM_GATE: the round to the gate's worker (the bucket's padding its last row, as below); the

@@ -1,0 +1,1771 @@
+diff --git a/engine/zig/zig/src/core/engine_api.zig b/engine/zig/zig/src/core/engine_api.zig
+index acad576..2526df9 100644
+--- a/engine/zig/zig/src/core/engine_api.zig
++++ b/engine/zig/zig/src/core/engine_api.zig
+@@ -193,6 +193,63 @@ pub const GraphsSource = struct {
+     read: *const fn (ctx: ?*anyopaque, out: []GraphStatus) usize,
+ };
+ 
++/// The active stream counts in a paged KV cache snapshot.
++pub const CacheStreams = struct {
++    decoding: u32 = 0,
++    prefilling: u32 = 0,
++    filling: u32 = 0,
++    paused: u32 = 0,
++    max: u32 = 0,
++};
++
++/// The local rank's streamed NVMe session-tier counters.
++pub const SpillStatus = struct {
++    /// The configured disk-tier budget, in GiB.
++    gib: f64 = 0,
++    entries: u64 = 0,
++    stored_bytes: u64 = 0,
++    written: u64 = 0,
++    written_bytes: u64 = 0,
++    loaded: u64 = 0,
++    loaded_bytes: u64 = 0,
++    loaded_tokens: u64 = 0,
++    restore_ms_p50: f64 = 0,
++    restore_ms_p95: f64 = 0,
++    write_failed: u64 = 0,
++    crc_failed: u64 = 0,
++    load_failed: u64 = 0,
++    load_unfit: u64 = 0,
++    disk_free_bytes: u64 = 0,
++};
++
++/// A local-rank paged-KV and retained-session snapshot. Its bytes are physical CUDA allocations on this rank, with no
++/// tensor reads or CUDA synchronization. Retained pages shared by a live slot are counted once.
++pub const CacheStatus = struct {
++    pool_tokens: u64 = 0,
++    pool_free_tokens: u64 = 0,
++    pool_kept_tokens: u64 = 0,
++    kept_prompts: u64 = 0,
++    /// RAM session snapshots outside the paged KV pool.
++    kept_bytes: u64 = 0,
++    kv_cache_payload_bytes: u64 = 0,
++    kv_cache_capacity_bytes: u64 = 0,
++    kv_cache_comp_bytes: u64 = 0,
++    kv_cache_index_bytes: u64 = 0,
++    kv_cache_ordinary_bytes: u64 = 0,
++    kv_cache_display_bytes: u64 = 0,
++    /// Maximum completed context position among live streams divided by the context window (idle: 0).
++    stream_kv_usage_ratio: f64 = 0,
++    streams: CacheStreams = .{},
++    spill: ?SpillStatus = null,
++};
++
++/// A family's CPU-only paged-cache snapshot, called only from LaneHost's engine thread. LaneHost publishes its copy
++/// under its scheduler lock, so HTTP status calls never inspect the family's mutable cache or session store.
++pub const CacheSource = struct {
++    ctx: ?*anyopaque = null,
++    read: *const fn (ctx: ?*anyopaque) ?CacheStatus,
++};
++
+ pub const Status = struct {
+     /// Requests in prefill or decode, and those waiting for a lane.
+     running: u32 = 0,
+@@ -210,6 +267,8 @@ pub const Status = struct {
+     oldest_queued_s: f64 = 0,
+     /// The round pace against its own baseline (core/pace.zig); null: the engine keeps none.
+     pace: ?PaceStatus = null,
++    /// The latest CPU-only paged-cache snapshot; null when the engine has no supported paged cache.
++    cache: ?CacheStatus = null,
+     /// The backend's graph caches, the first `graph_caches` of them (0: it keeps none).
+     graphs: [4]GraphStatus = @splat(.{}),
+     graph_caches: u8 = 0,
+diff --git a/engine/zig/zig/src/core/lane_host.zig b/engine/zig/zig/src/core/lane_host.zig
+index 1dc2cde..6d966b9 100644
+--- a/engine/zig/zig/src/core/lane_host.zig
++++ b/engine/zig/zig/src/core/lane_host.zig
+@@ -91,6 +91,8 @@ pub const LaneHost = struct {
+     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+     graphs: ?api.GraphsSource = null, // the backend's graph caches for /health; null: none
++    cache_source: ?api.CacheSource = null, // CPU-only paged-cache source, read only by the engine thread
++    cache_status: ?api.CacheStatus = null, // source copy plus live stream states, published under mutex
+     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
+     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
+     on_thread: ?ThreadInit = null,
+@@ -119,6 +121,7 @@ pub const LaneHost = struct {
+         submitted: i96 = 0,
+         began: i96 = 0,
+         prefilled: ?i96 = null,
++        prefill_completed: u64 = 0, // committed prompt rows, not the submitted prompt's length
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
+@@ -247,10 +250,48 @@ pub const LaneHost = struct {
+             .generation_tokens = h.live_generated,
+             .oldest_queued_s = if (h.queued.items.len > 0) seconds(now - oldestQueued(h)) else 0,
+             .pace = paceStatus(&h.pace, now),
++            .cache = h.cache_status,
+         };
+         if (h.graphs) |g| out.graph_caches = @intCast(g.read(g.ctx, &out.graphs));
+     }
+ 
++    /// Captures the family's CPU-only page/session book on the engine thread, then publishes it with live stream
++    /// progress under the same lock as status. HTTP callers only ever read `cache_status`.
++    fn publishCache(h: *LaneHost) void {
++        const source = h.cache_source orelse return;
++        var cache = source.read(source.ctx) orelse {
++            h.mutex.lockUncancelable(h.io);
++            h.cache_status = null;
++            h.mutex.unlock(h.io);
++            return;
++        };
++        h.mutex.lockUncancelable(h.io);
++        defer h.mutex.unlock(h.io);
++        var max_context: u64 = 0;
++        cache.streams = .{ .max = h.info_.lanes };
++        for (h.admitted.items) |job| {
++            if (!job.started) {
++                cache.streams.filling += 1;
++                continue;
++            }
++            if (job.stream.finished) continue;
++            if (job.prefilled == null) {
++                cache.streams.prefilling += 1;
++            } else if (job.stream.paused) {
++                cache.streams.paused += 1;
++            } else {
++                cache.streams.decoding += 1;
++            }
++            const completed = if (job.prefilled == null) job.prefill_completed else job.stream.cache_len;
++            max_context = @max(max_context, completed);
++        }
++        cache.stream_kv_usage_ratio = if (h.info_.context_window > 0)
++            @min(1.0, @as(f64, @floatFromInt(max_context)) / @as(f64, @floatFromInt(h.info_.context_window)))
++        else
++            0;
++        h.cache_status = cache;
++    }
++
+     fn oldestQueued(h: *const LaneHost) i96 {
+         var at = h.queued.items[0].submitted;
+         for (h.queued.items) |job| at = @min(at, job.submitted);
+@@ -504,6 +545,7 @@ pub const LaneHost = struct {
+                 _ = h.drop(job, h.words(e));
+                 continue;
+             };
++            job.prefill_completed = job.stream.cached;
+             rd.vtable.began(rd.ctx, @intFromPtr(job), b.damaged);
+         }
+         // this round's pieces, a decode round of the streams decoding, then the prompts whose rows are in
+@@ -530,9 +572,13 @@ pub const LaneHost = struct {
+                 jobs[n] = job;
+                 n += 1;
+             }
+-            if (n > 0) h.core.pieces(list[0..n]) catch |e| {
+-                for (jobs[0..n]) |job| h.dropPiece(job, h.words(e));
+-            };
++            if (n > 0) {
++                if (h.core.pieces(list[0..n])) |_| {
++                    for (jobs[0..n], list[0..n]) |job, piece| job.prefill_completed = piece.end;
++                } else |e| {
++                    for (jobs[0..n]) |job| h.dropPiece(job, h.words(e));
++                }
++            }
+         } else for (h.pieces.items) |piece| {
+             if (!piece.run) continue;
+             did = true;
+@@ -540,7 +586,9 @@ pub const LaneHost = struct {
+             if (job.stream.finished) continue;
+             h.core.piece(&job.stream, piece.start, piece.end, piece.save) catch |e| {
+                 h.dropPiece(job, h.words(e));
++                continue;
+             };
++            job.prefill_completed = piece.end;
+         }
+         const t1 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         // a joined prompt's last token decodes in this round's window (Config.join_tail; Python's batcher: `finals`
+@@ -772,11 +820,13 @@ pub const LaneHost = struct {
+ 
+     fn run(h: *LaneHost) void {
+         if (h.on_thread) |t| t.run(t.ctx) catch |e| std.log.err("lane host: the engine thread's init failed ({t})", .{e});
++        h.publishCache();
+         if (h.rounds) |rd| return h.runRounds(rd);
+         while (true) {
+             h.takeCancels();
+             while (h.admitOne()) {}
+             h.noteLive();
++            h.publishCache();
+             h.lock();
+             if (h.closing) {
+                 const left = h.queued.items.len + h.admitted.items.len;
+@@ -810,6 +860,7 @@ pub const LaneHost = struct {
+                     h.unlock();
+                 } else i += 1;
+             }
++            h.publishCache();
+         }
+     }
+ 
+@@ -835,6 +886,7 @@ pub const LaneHost = struct {
+             h.unlock();
+             const did = h.round(rd);
+             h.noteLive();
++            h.publishCache();
+             if (!did) {
+                 h.lock();
+                 if (h.cancels.items.len == 0) h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }) catch {};
+diff --git a/engine/zig/zig/src/families/deepseek_v41/forward.zig b/engine/zig/zig/src/families/deepseek_v41/forward.zig
+index 755000e..bc0acf7 100644
+--- a/engine/zig/zig/src/families/deepseek_v41/forward.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/forward.zig
+@@ -567,8 +567,8 @@ pub const Forward = struct {
+         ptr: *anyopaque,
+         commit: *const fn (ptr: *anyopaque, ids: []const u32) anyerror!void,
+         save: *const fn (ptr: *anyopaque) anyerror!void,
+-        /// `ids`: an NVMe entry's ids (the leader's prompt prefix: its tokens are not indexed)
+-        restore: *const fn (ptr: *anyopaque, id: u32, ids: []const i64) anyerror!void,
++        /// `want`: the leader's entry under `id`; `ids`: an NVMe entry's ids (the leader's prompt prefix, not indexed)
++        restore: *const fn (ptr: *anyopaque, id: u32, want: Want, ids: []const i64) anyerror!void,
+         /// CED replay's prompt snapshot: an entry at the slot's position, the slot keeps going (sessions_gpu.zig)
+         prompt: *const fn (ptr: *anyopaque) anyerror!void,
+         /// the slot empty: its pages back, the committed ids cleared
+@@ -577,6 +577,9 @@ pub const Forward = struct {
+         admit: ?*const fn (ptr: *anyopaque, msg: []const i64) anyerror!void = null,
+     };
+ 
++    /// The entry a restore names, as the leader holds it (a follower holding another one under the id refuses it).
++    pub const Want = struct { pos: u64, key: [16]u8 };
++
+     /// 64-67: dsq-zig-calib (TF_DSV41_CALIB=measure, calib_gpu.zig). 64: [op] every rank synchronizes its device and
+     /// reads its clock (a timed run's start or end); 65: [op, n] every rank's n samples (the marks paired up, ns)
+     /// all-gathered, so rank 0 takes the slower rank's statistic an entry (Python calib's gather_max)
+@@ -649,25 +652,27 @@ pub const Forward = struct {
+         f.slot = .{};
+     }
+ 
+-    /// Rank 0: a restore to the followers, with the entry's ids when it is not in RAM ([op, id, ids...]).
+-    pub fn sendRestore(f: *Forward, id: u32, ids: ?[]const u32) !void {
++    /// Rank 0: a restore to the followers ([op, id, pos, key as two words, ids...]; the ids when it is not in RAM).
++    pub fn sendRestore(f: *Forward, id: u32, want: Want, ids: ?[]const u32) !void {
+         if (!f.leads()) return;
+         const extra = if (ids) |x| x.len else 0;
+-        const msg = try f.gpa.alloc(i64, 2 + extra);
++        const msg = try f.gpa.alloc(i64, 5 + extra);
+         defer f.gpa.free(msg);
+         msg[0] = op_sess_restore;
+         msg[1] = id;
+-        if (ids) |x| for (x, msg[2..]) |t, *y| {
++        msg[2] = @intCast(want.pos);
++        msg[3] = std.mem.readInt(i64, want.key[0..8], .little);
++        msg[4] = std.mem.readInt(i64, want.key[8..16], .little);
++        if (ids) |x| for (x, msg[5..]) |t, *y| {
+             y.* = t;
+         };
+         try f.link.?.send(msg);
+     }
+ 
+-    /// Rank 0: a session operation to the followers (before running it).
+-    pub fn sendSess(f: *Forward, op: enum { save, restore, prompt }, id: u32) !void {
++    /// Rank 0: a session operation to the followers (before running it); a restore goes through `sendRestore`.
++    pub fn sendSess(f: *Forward, op: enum { save, prompt }, id: u32) !void {
+         if (f.leads()) try f.link.?.send(&.{ switch (op) {
+             .save => op_sess_save,
+-            .restore => op_sess_restore,
+             .prompt => op_sess_prompt,
+         }, id });
+     }
+@@ -794,8 +799,11 @@ pub const Forward = struct {
+             },
+             op_sess_restore => {
+                 const x = f.sess orelse return error.BadPlan;
+-                if (msg.len < 2) return error.BadPlan;
+-                try x.restore(x.ptr, @intCast(msg[1]), msg[2..]);
++                if (msg.len < 5) return error.BadPlan;
++                var key: [16]u8 = undefined;
++                std.mem.writeInt(i64, key[0..8], msg[3], .little);
++                std.mem.writeInt(i64, key[8..16], msg[4], .little);
++                try x.restore(x.ptr, @intCast(msg[1]), .{ .pos = @intCast(msg[2]), .key = key }, msg[5..]);
+             },
+             op_sess_prompt => {
+                 const x = f.sess orelse return error.BadPlan;
+diff --git a/engine/zig/zig/src/families/deepseek_v41/forward_prefill.zig b/engine/zig/zig/src/families/deepseek_v41/forward_prefill.zig
+index 36bdc4c..b572bff 100644
+--- a/engine/zig/zig/src/families/deepseek_v41/forward_prefill.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/forward_prefill.zig
+@@ -65,9 +65,9 @@ pub const State = struct {
+     /// options, buffer plan and arena stay the 2,048-row ones, so decode windows and the drafter are untouched
+     k4: bool = false,
+     k4ws: K4 = .{},
+-    /// the current prompt call may use the workspace (4K segments, TBO pairs): every rank's MemAvailable leaves the
+-    /// workspace above the hard floor (wsAgreed, one collective a call); false: this call runs 2,048-row segments, the
+-    /// same bits (segmentation-invariant), never a failure. True until a call decides (the planner reads it at boot)
++    /// the current prompt piece may use the workspace (4K segments, TBO pairs): every rank's MemAvailable clears
++    /// the floor after a new allocation or with an already-held workspace (wsAgreed, one collective per piece).
++    /// False: release a held workspace and use 2,048-row segments, with the same bits (segmentation-invariant).
+     ws_ok: bool = true,
+     ws_fallbacks: u64 = 0,
+     agreement: ?graphs.Agreement = null,
+@@ -334,28 +334,34 @@ pub fn segmentRows(f: *const Forward) usize {
+     return if (st.k4 and st.ws_ok) K4.rows else @intCast(f.opts.prefill_rows);
+ }
+ 
+-/// Whether this prompt call may use the workspace, on every rank alike: held already (a later piece of the prompt),
+-/// or every rank's MemAvailable less the workspace clears the hard floor (one all-gathered flag, graphs.Agreement).
+-/// No: the call runs 2,048-row segments (4K and 2K give the same bits), logged; nothing fails.
++/// Whether this prompt piece may use the workspace on every rank alike. Check available memory minus its cost
++/// before the first allocation, and actual available memory while it is held. If either rank falls below the
++/// floor during a long prefill, release the held workspace at this piece boundary and switch both ranks to 2K.
+ fn wsAgreed(f: *Forward) !bool {
+     const st = &f.prefill_state;
+     const ws = &st.k4ws;
+-    if (ws.buf != null) return true;
+     const pl = ws.plan orelse return false;
+     const bytes = planBytes(&pl);
+     const hard = wsFloorGiB();
+     const avail = graphs.memAvailableGiB();
+-    const left = if (avail) |v| v - @as(f64, @floatFromInt(bytes)) / (1 << 30) else hard;
++    const held = ws.buf != null;
++    const left = workspaceRemaining(avail, bytes, hard, held);
+     if (st.agreement == null) st.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
+     const ok = try st.agreement.?.agree().all(st.agreement.?.agree().ctx, left >= hard);
+     if (!ok) {
++        if (held) try k4Release(f);
+         st.ws_fallbacks += 1;
+-        if (st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
++        if (held or st.ws_fallbacks <= 4 or st.ws_fallbacks % 64 == 0)
+             log.warn("prefill workspace: {d} MiB does not fit on every rank (rank {d}: {d:.2} GiB MemAvailable leaves {d:.2}, floor {d:.1} GiB, TF_DSV41_PF_WS_FLOOR_GIB): this prompt piece runs 2,048-row segments (fallback {d})", .{ bytes >> 20, f.comm.rank(), avail orelse -1, left, hard, st.ws_fallbacks });
+     }
+     return ok;
+ }
+ 
++fn workspaceRemaining(avail: ?f64, bytes: u64, floor: f64, held: bool) f64 {
++    const free = avail orelse return floor;
++    return if (held) free else free - @as(f64, @floatFromInt(bytes)) / (1 << 30);
++}
++
+ /// The options a 4,096-row segment emits with: the forward's at 4,096 rows with x3gm one block a segment.
+ pub fn k4Options(o: block.Options) block.Options {
+     var x = o;
+@@ -402,7 +408,7 @@ fn k4Acquire(f: *Forward) !void {
+     if (ws.buf != null) return;
+     const pl = ws.plan orelse return error.Unbound;
+     const total = planBytes(&pl);
+-    // the room was agreed first (wsAgreed): every rank fits the workspace above the hard floor
++    // the room was agreed first (wsAgreed): every rank fits the workspace above the configured floor
+     const t0 = nowMs();
+     const b = cuda.DeviceBuffer.alloc(f.runner.d, @max(total, 256)) catch |e| {
+         log.err("prefill workspace: allocating {d} MiB failed ({t})", .{ total >> 20, e });
+@@ -491,7 +497,7 @@ pub fn prompt(f: *Forward, ids_in: []const u32) !void {
+     const ids = st.ids.items;
+     st.taps_rows = 0;
+     try ready(f);
+-    // TF_DSV41_PF_4K / _PF_TBO: the workspace for this call, decided on every rank alike (else 2,048-row segments)
++    // TF_DSV41_PF_4K / _PF_TBO: check the workspace on both ranks each piece (else 2,048-row segments).
+     st.ws_ok = true;
+     if (st.k4 or (st.mode == .replay and f.opts.pf_tbo)) st.ws_ok = try wsAgreed(f);
+     const seg: usize = segmentRows(f);
+@@ -1206,3 +1212,12 @@ fn glueOne(ctx: *anyopaque, r: *run.Runner, c: *const calls.Call) anyerror!void
+     }
+     return Forward.glueFn(ctx, r, c);
+ }
++
++test "a held prefill workspace rechecks available memory between prompt pieces" {
++    const bytes: u64 = 2268 << 20;
++    const floor = 1.0;
++    try std.testing.expect(workspaceRemaining(3.4, bytes, floor, false) >= floor);
++    try std.testing.expect(workspaceRemaining(1.0, bytes, floor, true) >= floor);
++    try std.testing.expect(workspaceRemaining(0.99, bytes, floor, true) < floor);
++    try std.testing.expect(workspaceRemaining(3.0, bytes, floor, false) < floor);
++}
+diff --git a/engine/zig/zig/src/families/deepseek_v41/serve_engine.zig b/engine/zig/zig/src/families/deepseek_v41/serve_engine.zig
+index dafcce2..6163f18 100644
+--- a/engine/zig/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -26,6 +26,7 @@ const grammar_gpu = @import("grammar_gpu.zig");
+ const Allocator = std.mem.Allocator;
+ const vision_rows = @import("vision_rows.zig");
+ const sched_host = @import("sched_host.zig");
++const sessions_gpu = @import("sessions_gpu.zig");
+ 
+ pub const backends: []const []const u8 = &.{"cuda"};
+ pub const families: []const api.Family = &.{.{ .model_type = "deepseek_v41", .formats = &.{"exl3"} }};
+@@ -153,6 +154,8 @@ pub const Served = struct {
+         s.host.memory = .{ .read = readMemory };
+         // /health's "graphs": each graph cache's held graphs, captures, replays, eager steps and floor state
+         s.host.graphs = .{ .read = readGraphs };
++        // /health's paged-KV/session snapshot: copied on the engine thread, then served by LaneHost without touching CUDA.
++        s.host.cache_source = .{ .ctx = m, .read = readCache };
+         // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
+         // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
+         s.sched = null;
+@@ -196,6 +199,13 @@ pub const Served = struct {
+         return .{ .active = u.device, .cache = 0, .peak = u.peak };
+     }
+ 
++    fn readCache(ctx: ?*anyopaque) ?api.CacheStatus {
++        const raw = ctx orelse return null;
++        const m: *model.Model = @ptrCast(@alignCast(raw));
++        const kx = m.f.kv orelse return null;
++        return sessions_gpu.cacheStatus(kx, m.sessions);
++    }
++
+     fn readGraphs(_: ?*anyopaque, out: []api.GraphStatus) usize {
+         const gc = @import("cuda").graph_cache;
+         var snaps: [4]gc.Snapshot = undefined;
+diff --git a/engine/zig/zig/src/families/deepseek_v41/session_recovery.zig b/engine/zig/zig/src/families/deepseek_v41/session_recovery.zig
+new file mode 100644
+index 0000000..63c6db6
+--- /dev/null
++++ b/engine/zig/zig/src/families/deepseek_v41/session_recovery.zig
+@@ -0,0 +1,68 @@
++//! Boot-only intersection of persisted prefix keys, before either rank assigns session entry IDs.
++const std = @import("std");
++const cuda = @import("cuda");
++const Forward = @import("forward.zig").Forward;
++const Digest = [16]u8;
++
++fn less(_: void, a: Digest, b: Digest) bool {
++    return std.mem.order(u8, &a, &b) == .lt;
++}
++
++fn contains(keys: []const Digest, key: Digest) bool {
++    var lo: usize = 0;
++    var hi = keys.len;
++    while (lo < hi) {
++        const mid = lo + (hi - lo) / 2;
++        switch (std.mem.order(u8, &key, &keys[mid])) {
++            .eq => return true,
++            .lt => hi = mid,
++            .gt => lo = mid + 1,
++        }
++    }
++    return false;
++}
++
++/// Every rank calls this once at boot, including ranks with no recoverable entries.
++pub fn keepCommon(ctx: *anyopaque, keys: []const Digest, mask: []bool) anyerror!void {
++    const f: *Forward = @ptrCast(@alignCast(ctx));
++    const world: usize = f.comm.world();
++    const driver = f.runner.d;
++    const stream = f.runner.stream;
++    var count_dev = try cuda.DeviceBuffer.alloc(driver, 8 * (world + 1));
++    defer count_dev.free();
++    var count_host = try cuda.HostBuffer.alloc(driver, 8 * (world + 1));
++    defer count_host.free();
++    const counts = count_host.slice(i64);
++    counts[0] = @intCast(keys.len);
++    try count_dev.uploadAsync(0, std.mem.sliceAsBytes(counts[0..1]), stream.handle);
++    try f.comm.allGather(count_dev.ptr, count_dev.ptr + 8, 1, .i64, stream.handle);
++    try count_dev.downloadAsync(8, std.mem.sliceAsBytes(counts[1 .. 1 + world]), stream.handle);
++    try stream.synchronize();
++    var largest: usize = 0;
++    for (counts[1 .. 1 + world]) |n| largest = @max(largest, @as(usize, @intCast(n)));
++    if (largest == 0) return;
++
++    const stride = largest * @sizeOf(Digest);
++    var key_dev = try cuda.DeviceBuffer.alloc(driver, stride * (world + 1));
++    defer key_dev.free();
++    var key_host = try cuda.HostBuffer.alloc(driver, stride * (world + 1));
++    defer key_host.free();
++    const all = key_host.slice(Digest);
++    @memset(key_host.slice(u8)[0..stride], 0);
++    @memcpy(all[0..keys.len], keys);
++    std.mem.sort(Digest, all[0..keys.len], {}, less);
++    try key_dev.uploadAsync(0, key_host.slice(u8)[0..stride], stream.handle);
++    try f.comm.allGather(key_dev.ptr, key_dev.ptr + stride, stride, .u8, stream.handle);
++    try key_dev.downloadAsync(stride, key_host.slice(u8)[stride .. stride * (world + 1)], stream.handle);
++    try stream.synchronize();
++    for (keys, mask) |key, *keep| {
++        keep.* = true;
++        for (counts[1 .. 1 + world], 0..) |n, rank| {
++            const peer = all[(rank + 1) * largest .. (rank + 1) * largest + @as(usize, @intCast(n))];
++            if (!contains(peer, key)) {
++                keep.* = false;
++                break;
++            }
++        }
++    }
++}
+diff --git a/engine/zig/zig/src/families/deepseek_v41/sessions_gpu.zig b/engine/zig/zig/src/families/deepseek_v41/sessions_gpu.zig
+index cb95e4a..3b8fa6c 100644
+--- a/engine/zig/zig/src/families/deepseek_v41/sessions_gpu.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/sessions_gpu.zig
+@@ -32,6 +32,7 @@
+ //! has neither. TF_DSV41_SESSION_SLOTS=1 opens the store with several live slots (default off: model.zig says so at
+ //! boot and serves without sessions, as before).
+ 
++const api = @import("engine_api");
+ const std = @import("std");
+ const cuda = @import("cuda");
+ const kv = @import("kv");
+@@ -58,6 +59,8 @@ pub const Options = struct {
+     disk: ?[]const u8 = null,
+     disk_budget: u64 = 64 << 30,
+     disk_min_tokens: u64 = 1024,
++    /// TF_DSV41_SESSION_DISK_WRITE_THROUGH=1: each eligible save is durable before returning.
++    write_through: bool = false,
+     resident: u32 = 0,
+     resident_bytes: u64 = 0,
+     /// TF_DSV41_SESSION_RAM_MIB (stack.py's default 256)
+@@ -87,6 +90,7 @@ pub fn optionsFromEnv() !Options {
+     if (std.c.getenv("TF_DSV41_SESSION_DISK_MIN")) |v| if (std.mem.span(v).len > 0) {
+         o.disk_min_tokens = try std.fmt.parseInt(u64, std.mem.span(v), 10);
+     };
++    o.write_through = flag("TF_DSV41_SESSION_DISK_WRITE_THROUGH");
+     if (std.c.getenv("TF_DSV41_SESSION_RESIDENT")) |v| o.resident = try std.fmt.parseInt(u32, std.mem.span(v), 10);
+     if (std.c.getenv("TF_DSV41_SESSION_RESIDENT_GIB")) |v| o.resident_bytes = @intFromFloat(try std.fmt.parseFloat(f64, std.mem.span(v)) * (1 << 30));
+     if (std.c.getenv("TF_DSV41_SESSION_RAM_MIB")) |v| if (std.mem.span(v).len > 0) {
+@@ -217,7 +221,15 @@ pub const Sessions = struct {
+             s.disk = try sessions.Disk.open(gpa, io, .{ .root = root, .compat = full[0..16].*, .rank = kx.rank, .world = kx.world, .budget = o.disk_budget, .min_tokens = o.disk_min_tokens, .staging = @max(2, o.staging_mib / 8), .chunk = 8 << 20 });
+         }
+         errdefer if (s.disk) |dd| dd.close();
+-        s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes, .skip_covered = o.skip_covered, .delta = o.delta });
++        s.store = try Store.init(gpa, io, &kx.pool, kx.dev.store(), s.disk, .{ .ram_bytes = o.ram_bytes, .chats = o.resident, .resident_bytes = o.resident_bytes, .skip_covered = o.skip_covered, .delta = o.delta, .write_through = o.write_through });
++        errdefer s.store.deinit();
++        if (s.disk != null) {
++            const recovered = try s.store.reconcile(if (f.comm.world() > 1)
++                .{ .ctx = f, .keep = @import("session_recovery.zig").keepCommon }
++            else
++                null);
++            std.log.scoped(.dsv41).info("sessions: recovered {d} common NVMe entries; write-through {s}, disk budget {d} GiB, minimum {d} tokens", .{ recovered, if (o.write_through) "on" else "off", o.disk_budget >> 30, o.disk_min_tokens });
++        }
+         if (f.comm.world() > 1) s.agreement = try graphs.Agreement.init(f.runner.d, f.comm, f.runner.stream);
+         f.sess = .{ .ptr = s, .commit = commitFn, .save = saveFn, .restore = restoreFn, .reset = resetFn, .prompt = promptFn, .admit = admitFn };
+         return s;
+@@ -243,12 +255,12 @@ pub const Sessions = struct {
+         try s.reset();
+     }
+ 
+-    fn restoreFn(ptr: *anyopaque, id: u32, ids: []const i64) anyerror!void {
++    fn restoreFn(ptr: *anyopaque, id: u32, want: fwd.Forward.Want, ids: []const i64) anyerror!void {
+         const s: *Sessions = @ptrCast(@alignCast(ptr));
+         const p = try s.gpa.alloc(u32, ids.len);
+         defer s.gpa.free(p);
+         for (ids, p) |t, *y| y.* = @intCast(t);
+-        _ = try s.restore(id, if (ids.len > 0) p else null);
++        _ = try s.restoreAs(id, want, if (ids.len > 0) p else null);
+     }
+ 
+     /// A follower: the leader's admission (forward.zig op_sess_admit: [op, need, n, spilled ids...]).
+@@ -522,8 +534,10 @@ pub const Sessions = struct {
+         const n = prompt.len;
+         // out of RAM no tokens are indexed: the history is the prompt's prefix (rounds.py `_admit`)
+         const ids: ?[]const u32 = if (s.store.entry(h.id).ram) null else prompt[0..@intCast(h.pos)];
+-        try s.f.sendRestore(h.id, ids);
+-        if (!try s.restore(h.id, ids)) return .{ .damaged = true };
++        // the entry by its position and key too: a follower whose own entry under the id is another one refuses it
++        const want: fwd.Forward.Want = .{ .pos = h.pos, .key = s.store.entry(h.id).key };
++        try s.f.sendRestore(h.id, want, ids);
++        if (!try s.restoreAs(h.id, want, ids)) return .{ .damaged = true };
+         std.log.scoped(.dsv41).info("sessions: slot {d} resumed {d} of {d} prompt tokens from {s}", .{ s.cur(), h.pos, n, if (h.ram) "RAM" else "NVMe" });
+         return .{ .at = h.pos };
+     }
+@@ -556,21 +570,28 @@ pub const Sessions = struct {
+ 
+     /// Entry `id` into the empty slot, agreed (lockstep.zig); false: not back on some rank, so a miss everywhere.
+     pub fn restore(s: *Sessions, id: u32, ids: ?[]const u32) !bool {
++        return s.restoreAs(id, null, ids);
++    }
++
++    /// `restore` of the leader's entry `want`: a rank holding another entry under `id` fails it, a miss on every rank.
++    pub fn restoreAs(s: *Sessions, id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !bool {
+         if (s.f.slot.pos != 0 or s.kx.slot.len != 0) return error.SlotNotEmpty;
+         try s.active();
+-        const pos = s.store.entry(id).pos;
++        const pos = if (want) |w| w.pos else s.store.entry(id).pos;
+         const g: ?lockstep.Agree = if (s.agreement) |*a| blk: {
+             const x = a.agree();
+             break :blk .{ .ctx = x.ctx, .all = x.all };
+         } else null;
+-        if (!try lockstep.agreed(g, s.restoreOn(id, ids), "a session restore", s.f.comm.rank())) {
++        if (!try lockstep.agreed(g, s.restoreOn(id, want, ids), "a session restore", s.f.comm.rank())) {
+             try s.kx.truncate(0);
+             s.f.slot = .{};
+             s.hist[s.cur()].clearRetainingCapacity();
+             s.ds_valid[s.cur()] = 0;
+-            // a cache miss from here: the entry out of RAM and its file deleted, on every rank alike
+-            if (s.store.entry(id).ram) try s.store.drop(id);
+-            if (s.store.entry(id).live) try s.store.forget(id); // drop removed an entry no file holds
++            // a cache miss from here: the entry out of RAM and its file deleted, on every rank holding one
++            if (s.store.index.has(id)) {
++                if (s.store.entry(id).ram) try s.store.drop(id);
++                if (s.store.entry(id).live) try s.store.forget(id); // drop removed an entry no file holds
++            }
+             s.stats.damaged += 1;
+             std.log.scoped(.dsv41).warn("sessions: slot {d}: the entry of {d} tokens did not come back; its prompt prefills from 0", .{ s.cur(), pos });
+             return false;
+@@ -579,8 +600,13 @@ pub const Sessions = struct {
+         return true;
+     }
+ 
+-    /// This rank's restore of `id`: pages and bounded state (RAM or NVMe), the position, the slot's history.
+-    fn restoreOn(s: *Sessions, id: u32, ids: ?[]const u32) !void {
++    /// This rank's restore of `id`: pages and bounded state (RAM or NVMe), position, history; refused if not `want`.
++    fn restoreOn(s: *Sessions, id: u32, want: ?fwd.Forward.Want, ids: ?[]const u32) !void {
++        if (want) |w| if (!s.store.index.holds(id, w.pos, w.key)) {
++            const here: u64 = if (s.store.index.has(id) and s.store.entry(id).live) s.store.entry(id).pos else 0;
++            std.log.scoped(.dsv41).warn("sessions: rank {d}: entry {d} here is not the leader's (here {d} tokens, the leader's {d})", .{ s.f.comm.rank(), id, here, w.pos });
++            return error.NotTheEntry;
++        };
+         const e = s.store.entry(id);
+         const pos = e.pos;
+         if (e.ram) {
+@@ -601,9 +627,20 @@ pub const Sessions = struct {
+ 
+     fn restoreDisk(s: *Sessions, id: u32) !void {
+         const j = try s.store.beginRestore(id, s.kx.slot);
+-        var restored = (try s.store.settle(j)) orelse return error.BadBlob;
++        const result = try s.store.settle(j);
++        var restored = result orelse {
++            s.store.restoreUnfit();
++            return error.BadBlob;
++        };
+         defer restored.deinit(s.gpa);
+-        try s.uploadBlobs(restored.blobs);
++        s.uploadBlobs(restored.blobs) catch |e| {
++            s.store.restoreUnfit();
++            return e;
++        };
++        if (s.f.slot.pos != s.store.entry(id).pos) {
++            s.store.restoreUnfit();
++            return error.RestoredPosition;
++        }
+     }
+ 
+     /// Every RAM entry parked to the NVMe tier now (the gate's interruption; a server parks through the budget).
+@@ -620,3 +657,60 @@ pub const Sessions = struct {
+         return n;
+     }
+ };
++
++/// CPU-only cache telemetry for the paged DeepSeek pool on this rank. The caller runs it on LaneHost's engine thread;
++/// it inspects pool/session bookkeeping and allocation metadata only, never CUDA state or tensor contents.
++pub fn cacheStatus(kx: *const kvs.Kv, ss: ?*const Sessions) api.CacheStatus {
++    var comp_bytes: u64 = 0;
++    var index_bytes: u64 = 0;
++    for (kx.pool.layout.families, kx.dev.tensors) |family, tensor| {
++        if (std.mem.startsWith(u8, family.name, "comp.")) {
++            comp_bytes += @as(u64, @intCast(tensor.len));
++        } else if (std.mem.startsWith(u8, family.name, "index_k.")) {
++            index_bytes += @as(u64, @intCast(tensor.len));
++        }
++    }
++    const payload = comp_bytes + index_bytes;
++    var out: api.CacheStatus = .{
++        .pool_tokens = @as(u64, kx.pool.npages) * @as(u64, kx.pool.page),
++        .pool_free_tokens = @as(u64, kx.pool.freePages()) * @as(u64, kx.pool.page),
++        .kv_cache_payload_bytes = payload,
++        .kv_cache_capacity_bytes = payload,
++        .kv_cache_comp_bytes = comp_bytes,
++        .kv_cache_index_bytes = index_bytes,
++        .kv_cache_ordinary_bytes = payload,
++    };
++    const s = ss orelse return out;
++    out.pool_kept_tokens = s.store.kept_tokens;
++    out.kept_prompts = s.store.ram_count;
++    out.kept_bytes = @as(u64, s.store.ram_count) * s.bounded_bytes;
++    const d = s.disk orelse return out;
++    const free = d.freeBytes() orelse return out;
++    var entries: u64 = 0;
++    var stored_bytes: u64 = 0;
++    for (d.recs.items) |entry| {
++        if (entry.live) {
++            entries += 1;
++            stored_bytes += entry.size;
++        }
++    }
++    const latency = s.store.restoreLatency();
++    out.spill = .{
++        .gib = @as(f64, @floatFromInt(d.opts.budget)) / @as(f64, 1 << 30),
++        .entries = entries,
++        .stored_bytes = stored_bytes,
++        .written = d.stats.writes,
++        .written_bytes = d.stats.bytes_written,
++        .loaded = s.store.stats.hits_disk,
++        .loaded_bytes = d.stats.bytes_read,
++        .loaded_tokens = s.store.stats.loaded_tokens,
++        .restore_ms_p50 = latency.p50_ms,
++        .restore_ms_p95 = latency.p95_ms,
++        .write_failed = s.store.stats.park_failed,
++        .crc_failed = s.store.stats.restore_crc_failed,
++        .load_failed = s.store.stats.restore_failed,
++        .load_unfit = s.store.stats.restore_unfit,
++        .disk_free_bytes = free,
++    };
++    return out;
++}
+diff --git a/engine/zig/zig/src/server/metrics.zig b/engine/zig/zig/src/server/metrics.zig
+index 0282652..95e49a0 100644
+--- a/engine/zig/zig/src/server/metrics.zig
++++ b/engine/zig/zig/src/server/metrics.zig
+@@ -121,7 +121,10 @@ pub const Metrics = struct {
+         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+         const live = streams[0..@min(status.streams, streams.len)];
+         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
+-        try pools(w, "kv_cache_usage_ratio", "pool", live, window);
++        if (status.cache) |cache| {
++            try labeledFloatGauge(w, "kv_cache_usage_ratio", "pool", "0", cache.stream_kv_usage_ratio);
++            try cacheMetrics(w, cache);
++        } else try pools(w, "kv_cache_usage_ratio", "pool", live, window);
+         try gauge(w, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.", snap.drafted);
+         try gauge(w, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.", snap.accepted);
+         try histogram(w, "request_latency_seconds", "Seconds from arrival to the reply leaving.", snap.latency);
+@@ -167,6 +170,54 @@ fn pools(w: *std.Io.Writer, name: []const u8, label: []const u8, lengths: []cons
+     }
+ }
+ 
++fn floatGauge(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8, value: f64) !void {
++    try family(w, name, kind, help);
++    var buf: [40]u8 = undefined;
++    try w.print("{s}{s} {s}\n", .{ prefix, name, num(&buf, value) });
++}
++
++fn labeledFloatGauge(w: *std.Io.Writer, name: []const u8, label: []const u8, value_label: []const u8, value: f64) !void {
++    var buf: [40]u8 = undefined;
++    try w.print("{s}{s}{{{s}=\"{s}\"}} {s}\n", .{ prefix, name, label, value_label, num(&buf, value) });
++}
++
++fn cacheMetrics(w: *std.Io.Writer, cache: api.CacheStatus) !void {
++    try gauge(w, "pool_tokens", "gauge", "Positions in the shared KV pool on this rank.", cache.pool_tokens);
++    try gauge(w, "pool_free_tokens", "gauge", "Unallocated positions in the paged KV pool.", cache.pool_free_tokens);
++    try gauge(w, "pool_kept_tokens", "gauge", "Pool positions reserved for retained prompts.", cache.pool_kept_tokens);
++    try gauge(w, "kept_prompts", "gauge", "Retained prompts in memory.", cache.kept_prompts);
++    try gauge(w, "kept_bytes", "gauge", "Unique retained snapshot tensor bytes outside the shared pool.", cache.kept_bytes);
++    try gauge(w, "kv_cache_payload_bytes", "gauge", "Compressed KV and indexer tensor bytes on this rank.", cache.kv_cache_payload_bytes);
++    try gauge(w, "kv_cache_capacity_bytes", "gauge", "Backing capacity for compressed KV and indexer tensors on this rank.", cache.kv_cache_capacity_bytes);
++    try gauge(w, "kv_cache_comp_bytes", "gauge", "Compressed KV tensor bytes on this rank.", cache.kv_cache_comp_bytes);
++    try gauge(w, "kv_cache_index_bytes", "gauge", "KV indexer tensor bytes on this rank.", cache.kv_cache_index_bytes);
++    try gauge(w, "kv_cache_ordinary_bytes", "gauge", "Ordinary CUDA backing for compressed KV and indexer tensors on this rank.", cache.kv_cache_ordinary_bytes);
++    try gauge(w, "kv_cache_display_bytes", "gauge", "Display reservation mapped for KV on this rank.", cache.kv_cache_display_bytes);
++    const used = cache.pool_tokens -| cache.pool_free_tokens;
++    try gauge(w, "pool_used_tokens", "gauge", "Allocated paged KV positions held by streams and retained prompts.", used);
++    const ratio: f64 = if (cache.pool_tokens == 0) 0 else @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(cache.pool_tokens));
++    try floatGauge(w, "kv_pool_usage_ratio", "gauge", "Allocated paged KV positions divided by total positions.", ratio);
++    try family(w, "kv_cache_backing_info", "gauge", "Backing for this rank's compressed KV and indexer tensors.");
++    try w.print("{s}kv_cache_backing_info{{backing=\"cuda\"}} 1\n", .{prefix});
++    if (cache.spill) |spill| {
++        try floatGauge(w, "spill_gib", "gauge", "Spill tier capacity in GiB.", spill.gib);
++        try gauge(w, "spill_entries", "gauge", "Spill tier entries.", spill.entries);
++        try gauge(w, "spill_stored_bytes", "gauge", "Spill tier bytes stored.", spill.stored_bytes);
++        try gauge(w, "spill_disk_free_bytes", "gauge", "Free bytes on the spill filesystem.", spill.disk_free_bytes);
++        try gauge(w, "spill_written_total", "counter", "Spill writes.", spill.written);
++        try gauge(w, "spill_written_bytes_total", "counter", "Bytes written to spill.", spill.written_bytes);
++        try gauge(w, "spill_loaded_total", "counter", "Spill loads.", spill.loaded);
++        try gauge(w, "spill_loaded_bytes_total", "counter", "Bytes loaded from spill.", spill.loaded_bytes);
++        try gauge(w, "spill_loaded_tokens_total", "counter", "Tokens restored from spill.", spill.loaded_tokens);
++        try gauge(w, "spill_write_failed_total", "counter", "Failed spill writes.", spill.write_failed);
++        try gauge(w, "spill_crc_failed_total", "counter", "Spill checksum failures.", spill.crc_failed);
++        try gauge(w, "spill_load_failed_total", "counter", "Failed spill loads.", spill.load_failed);
++        try gauge(w, "spill_load_unfit_total", "counter", "Spill loads that no longer fit.", spill.load_unfit);
++        try floatGauge(w, "spill_restore_seconds_p50", "gauge", "Spill restore p50 seconds.", spill.restore_ms_p50 / 1000);
++        try floatGauge(w, "spill_restore_seconds_p95", "gauge", "Spill restore p95 seconds.", spill.restore_ms_p95 / 1000);
++    }
++}
++
+ fn histogram(w: *std.Io.Writer, name: []const u8, help: []const u8, h: anytype) !void {
+     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} histogram\n", .{ prefix, name, help, prefix, name });
+     var cumulative: u64 = 0;
+@@ -234,9 +285,11 @@ const RenderStub = struct {
+         unreachable;
+     }
+     pub fn cancel(_: *anyopaque, _: api.Id) void {}
+-    pub fn status(ctx: *anyopaque, out: *api.Status, _: []u32) void {
++    pub fn status(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
+         const s: *@This() = @ptrCast(@alignCast(ctx));
+         out.* = s.status_value;
++        const n = @min(stream_tokens.len, s.tokens.len);
++        @memcpy(stream_tokens[0..n], s.tokens[0..n]);
+     }
+     pub fn memory(ctx: *anyopaque, _: bool) ?api.Memory {
+         const s: *@This() = @ptrCast(@alignCast(ctx));
+@@ -244,6 +297,7 @@ const RenderStub = struct {
+     }
+     status_value: api.Status = .{ .running = 1, .waiting = 2, .generation_tokens = 3 },
+     memory_value: ?api.Memory = null,
++    tokens: []const u32 = &.{},
+ 
+     pub fn engine(s: *@This()) api.Engine {
+         return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+@@ -273,6 +327,38 @@ test "render exposes live counters, rounds, prefill and TPOT without cache famil
+     try std.testing.expect(std.mem.indexOf(u8, known.written(), "tensorfold:device_memory_peak_bytes 8589934592\n") != null);
+ }
+ 
++test "stream cache occupancy remains distinct from shared-pool reservations" {
++    const gpa = std.testing.allocator;
++    var m: Metrics = .{ .gpa = gpa };
++    var stub: RenderStub = .{ .status_value = .{
++        .streams = 2,
++        .cache = .{
++            .pool_tokens = 100,
++            .pool_free_tokens = 25,
++            .pool_kept_tokens = 20,
++            .stream_kv_usage_ratio = 0.5,
++            .streams = .{ .decoding = 2, .max = 4 },
++            .spill = .{ .restore_ms_p95 = 9 },
++        },
++    }, .tokens = &.{ 2048, 1024 } };
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
++    const body = out.written();
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0.5\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "kv_cache_usage_ratio{pool=\"1\"}") == null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_usage_ratio 0.75\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:spill_restore_seconds_p95 0.009\n") != null);
++    stub.status_value.cache.?.stream_kv_usage_ratio = 0;
++    stub.status_value.cache.?.streams.decoding = 0;
++    stub.status_value.streams = 0;
++    var idle: std.Io.Writer.Allocating = .init(gpa);
++    defer idle.deinit();
++    try m.render(std.testing.io, &idle.writer, stub.engine(), 4096);
++    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:kv_cache_usage_ratio{pool=\"0\"} 0\n") != null);
++    try std.testing.expect(std.mem.indexOf(u8, idle.written(), "tensorfold:kv_pool_usage_ratio 0.75\n") != null);
++}
++
+ test "metrics snapshot allocation failure releases the mutex" {
+     const io = std.testing.io;
+     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+diff --git a/engine/zig/zig/src/server/spark.zig b/engine/zig/zig/src/server/spark.zig
+index 00cacd2..9ae6eac 100644
+--- a/engine/zig/zig/src/server/spark.zig
++++ b/engine/zig/zig/src/server/spark.zig
+@@ -6,8 +6,8 @@
+ //!   the context limit in OpenAI's and vLLM's words, which clients parse to compact.
+ //! - **/health** (``Health``): ok / fatal / stalled / inflight and upstream's live totals (``drafted_total``,
+ //!   ``accepted_total``, ...); strict mode answers 503 after a fatal engine error and refuses new completions.
+-//! - **/metrics**: the ``tensorfold_*`` rows. **/v1/models**: ``max_model_len`` / ``context_length``, aliases.
+-//! - **Request log** (``RequestLog``): one JSON line a request, token counts, timings and hashes only.
++//! - **/metrics**: Spark's ``tensorfold_*`` health rows plus native ``tensorfold:*`` serving metrics.
++//!   **/v1/models**: ``max_model_len`` / ``context_length``, aliases.
+ //!
+ //! Knobs are the Python names: ``GLM53_TF_X`` wins, else ``TF_DSV41_X`` (``app.alias_knobs``): REQUEST_LOG (with
+ //! GLM53_TF_REQUEST_LOG_MB / _KEEP / _PROMPTS / _SALT), DISCONNECT (1), HEALTH (basic | strict), STALL_S (0), and
+@@ -21,7 +21,13 @@ const Allocator = std.mem.Allocator;
+ /// ``spark`` replies use the served ``model``, no ``completion_tokens_details``, the engine stats under ``tensorfold``.
+ pub const Wire = enum { tensorfold, spark };
+ /// /health's ``streams``: a batch engine's slots decoding, prefilling, and in all.
+-pub const Streams = struct { decoding: u32, prefilling: u32, max: u32 };
++pub const Streams = struct {
++    decoding: u32,
++    prefilling: u32,
++    filling: ?u32 = null,
++    paused: ?u32 = null,
++    max: u32,
++};
+ pub const Mode = enum { basic, strict };
+ 
+ /// The random hex digits after a reply id's ``chatcmpl-`` / ``cmpl-`` (``uuid4().hex[:24]``).
+@@ -334,6 +340,8 @@ pub const Health = struct {
+             const x = try json.newObject(a);
+             try x.put(a, "decoding", try json.intValue(a, s.decoding));
+             try x.put(a, "prefilling", try json.intValue(a, s.prefilling));
++            if (s.filling) |n| try x.put(a, "filling", try json.intValue(a, n));
++            if (s.paused) |n| try x.put(a, "paused", try json.intValue(a, n));
+             try x.put(a, "max", try json.intValue(a, s.max));
+             try o.put(a, "streams", .{ .object = x });
+         }
+diff --git a/engine/zig/zig/src/server/status_routes.zig b/engine/zig/zig/src/server/status_routes.zig
+index 1eb283b..d85baf9 100644
+--- a/engine/zig/zig/src/server/status_routes.zig
++++ b/engine/zig/zig/src/server/status_routes.zig
+@@ -40,6 +40,50 @@ fn queueFields(a: Allocator, o: *json.Object, st: api.Status) Allocator.Error!vo
+     try o.put(a, "rounds", .{ .object = x });
+ }
+ 
++fn cacheFields(a: Allocator, o: *json.Object, cache: api.CacheStatus) Allocator.Error!void {
++    try o.put(a, "pool_tokens", try json.intValue(a, cache.pool_tokens));
++    try o.put(a, "pool_free_tokens", try json.intValue(a, cache.pool_free_tokens));
++    try o.put(a, "pool_used_tokens", try json.intValue(a, cache.pool_tokens -| cache.pool_free_tokens));
++    try o.put(a, "pool_kept_tokens", try json.intValue(a, cache.pool_kept_tokens));
++    try o.put(a, "kept_prompts", try json.intValue(a, cache.kept_prompts));
++    try o.put(a, "kept_bytes", try json.intValue(a, cache.kept_bytes));
++    try o.put(a, "kv_cache_payload_bytes", try json.intValue(a, cache.kv_cache_payload_bytes));
++    try o.put(a, "kv_cache_capacity_bytes", try json.intValue(a, cache.kv_cache_capacity_bytes));
++    try o.put(a, "kv_cache_comp_bytes", try json.intValue(a, cache.kv_cache_comp_bytes));
++    try o.put(a, "kv_cache_index_bytes", try json.intValue(a, cache.kv_cache_index_bytes));
++    try o.put(a, "kv_cache_ordinary_bytes", try json.intValue(a, cache.kv_cache_ordinary_bytes));
++    try o.put(a, "kv_cache_display_bytes", try json.intValue(a, cache.kv_cache_display_bytes));
++    try o.put(a, "kv_cache_backing", .{ .string = "cuda" });
++    try o.put(a, "kv_cache_bytes_scope", .{ .string = "compressed_kv_and_indexer_per_rank" });
++    try o.put(a, "stream_kv_usage_ratio", .{ .float = cache.stream_kv_usage_ratio });
++    const streams = try json.newObject(a);
++    try streams.put(a, "decoding", try json.intValue(a, cache.streams.decoding));
++    try streams.put(a, "prefilling", try json.intValue(a, cache.streams.prefilling));
++    try streams.put(a, "filling", try json.intValue(a, cache.streams.filling));
++    try streams.put(a, "paused", try json.intValue(a, cache.streams.paused));
++    try streams.put(a, "max", try json.intValue(a, cache.streams.max));
++    try o.put(a, "streams", .{ .object = streams });
++    if (cache.spill) |spill| {
++        const s = try json.newObject(a);
++        try s.put(a, "gib", .{ .float = spill.gib });
++        try s.put(a, "entries", try json.intValue(a, spill.entries));
++        try s.put(a, "stored_bytes", try json.intValue(a, spill.stored_bytes));
++        try s.put(a, "written", try json.intValue(a, spill.written));
++        try s.put(a, "written_bytes", try json.intValue(a, spill.written_bytes));
++        try s.put(a, "loaded", try json.intValue(a, spill.loaded));
++        try s.put(a, "loaded_bytes", try json.intValue(a, spill.loaded_bytes));
++        try s.put(a, "loaded_tokens", try json.intValue(a, spill.loaded_tokens));
++        try s.put(a, "write_failed", try json.intValue(a, spill.write_failed));
++        try s.put(a, "crc_failed", try json.intValue(a, spill.crc_failed));
++        try s.put(a, "load_failed", try json.intValue(a, spill.load_failed));
++        try s.put(a, "load_unfit", try json.intValue(a, spill.load_unfit));
++        try s.put(a, "disk_free_bytes", try json.intValue(a, spill.disk_free_bytes));
++        try s.put(a, "restore_ms_p50", .{ .float = spill.restore_ms_p50 });
++        try s.put(a, "restore_ms_p95", .{ .float = spill.restore_ms_p95 });
++        try o.put(a, "spill", .{ .object = s });
++    }
++}
++
+ /// With keys on, health names nothing about the model.
+ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     // draining: the engine is not asked, it may be stopping
+@@ -50,12 +94,20 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+         var st: api.Status = .{};
+         if (!drain) {
+             srv.engine.status(&st, &.{});
+-            const lanes = srv.info.lanes;
+-            if (lanes > 1) streams = .{ .decoding = st.running -| st.waiting, .prefilling = st.waiting, .max = lanes };
++            if (st.cache) |cache| {
++                streams = .{
++                    .decoding = cache.streams.decoding,
++                    .prefilling = cache.streams.prefilling,
++                    .filling = cache.streams.filling,
++                    .paused = cache.streams.paused,
++                    .max = cache.streams.max,
++                };
++            } else if (srv.info.lanes > 1) streams = .{ .decoding = st.running -| st.waiting, .prefilling = st.waiting, .max = srv.info.lanes };
+         }
+         const r = try h.status(a, streams, srv.info.context_window);
+         if (!drain) {
+             try queueFields(a, r.body.object, st);
++            if (st.cache) |cache| try cacheFields(a, r.body.object, cache);
+             const inflight = if (r.body.object.get("inflight")) |v| @as(usize, @intCast(v.int64() orelse 0)) else 0;
+             if (try h.stuck(a, st, inflight)) |why| {
+                 // the watchdog's restart signal: the engine is stuck, not merely busy
+@@ -83,6 +135,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
+     var status: api.Status = .{};
+     srv.engine.status(&status, &.{});
+     try o.put(a, "warming", .{ .bool = status.warming });
++    if (status.cache) |cache| try cacheFields(a, o, cache);
+     const memory = try json.newObject(a);
+     if (srv.engine.memory(std.mem.indexOf(u8, conn.path, "reset_peak=1") != null)) |mem| {
+         try memory.put(a, "active", try json.intValue(a, mem.active));
+@@ -115,7 +168,10 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
+ /// Prometheus text, version 0.0.4.
+ pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
+     var out: std.Io.Writer.Allocating = .init(a);
+-    if (srv.health) |h| h.metrics(&out.writer, srv.config.served_name) catch return else srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
++    if (srv.health) |h| {
++        srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
++        h.metrics(&out.writer, srv.config.served_name) catch return;
++    } else srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
+     const body = out.written();
+     conn.startResponse(200, null) catch return;
+     conn.addHeader("Content-Type", if (srv.health != null) "text/plain; version=0.0.4" else "text/plain; version=0.0.4; charset=utf-8") catch return;
+diff --git a/engine/zig/zig/src/sessions/disk.zig b/engine/zig/zig/src/sessions/disk.zig
+index f106ce3..7041646 100644
+--- a/engine/zig/zig/src/sessions/disk.zig
++++ b/engine/zig/zig/src/sessions/disk.zig
+@@ -22,6 +22,24 @@ const pool_mod = @import("pool.zig");
+ const Family = pool_mod.Family;
+ const Digest = @import("prefix.zig").Digest;
+ 
++/// Linux `struct statfs`, used only for the tier's mounted-filesystem free-space snapshot.
++const Statfs = extern struct {
++    f_type: c_long,
++    f_bsize: c_long,
++    f_blocks: u64,
++    f_bfree: u64,
++    f_bavail: u64,
++    f_files: u64,
++    f_ffree: u64,
++    f_fsid: [2]i32,
++    f_namelen: c_long,
++    f_frsize: c_long,
++    f_flags: c_long,
++    f_spare: [4]c_long,
++};
++
++extern "c" fn fstatfs(fd: linux.fd_t, buf: *Statfs) c_int;
++
+ pub const none = std.math.maxInt(u32);
+ 
+ pub const Options = struct {
+@@ -29,7 +47,7 @@ pub const Options = struct {
+     compat: Digest,
+     rank: u32 = 0,
+     world: u32 = 1,
+-    /// bytes of files the tier keeps (least recently used files without dependents go first)
++    /// charges of files the tier keeps (alike on every rank); least recently used files without dependents go first
+     budget: u64 = 64 << 30,
+     /// entries shorter than this are dropped, not parked
+     min_tokens: u64 = 1024,
+@@ -112,6 +130,8 @@ pub const Rec = struct {
+     first_page: u32,
+     npages: u32,
+     size: u64,
++    /// rank-independent logical bytes, reconstructed from the file's segments at boot
++    charge: u64,
+     /// files stacked on this one
+     refs: u32 = 0,
+     /// files under it, this one included
+@@ -143,7 +163,7 @@ pub const Disk = struct {
+     /// least recently used first
+     oldest: u32 = none,
+     newest: u32 = none,
+-    used: u64 = 0,
++    used: u64 = 0, // the files' charges, which `trim` holds to the budget
+     stats: Stats = .{},
+ 
+     pub fn open(gpa: std.mem.Allocator, io: Io, opts: Options) !*Disk {
+@@ -176,6 +196,14 @@ pub const Disk = struct {
+         return pos >= d.opts.min_tokens;
+     }
+ 
++    /// Available bytes on the filesystem carrying this rank's tier directory. A failed stat deliberately has no value:
++    /// callers omit the optional spill snapshot rather than report a made-up zero.
++    pub fn freeBytes(d: *const Disk) ?u64 {
++        var fs: Statfs = undefined;
++        if (fstatfs(d.dir.handle, &fs) != 0 or fs.f_bsize <= 0) return null;
++        return fs.f_bavail * @as(u64, @intCast(fs.f_bsize));
++    }
++
+     pub fn get(d: *Disk, key: Digest) ?*Rec {
+         const i = d.by_key.get(key) orelse return null;
+         return &d.recs.items[i];
+@@ -397,16 +425,27 @@ pub const Disk = struct {
+         }
+     }
+ 
++    /// Logical file bytes: split pages at each rank's average, tokens, and bounded blobs. A compatible build
++    /// produces the same blob lengths on both ranks; unlike Bounded.nbytes, their actual lengths survive a restart.
++    fn chargeOf(page: u32, first_page: u32, npages: u32, ids_bytes: u64, blob_bytes: u64, families: []const Family, world: u32) u64 {
++        var charge = ids_bytes + blob_bytes;
++        for (families) |f| charge += @as(u64, npages - first_page) * f.pageBytes(page) / (if (f.split and world > 1) world else 1);
++        return charge;
++    }
++
+     /// Records a written file in the index (round thread, at the plan's point); its base gains a dependent.
+     pub fn register(d: *Disk, src: *const WriteSrc, size: u64) !u32 {
+-        const id = try d.add(src.key, src.base, src.tag, src.kind, src.pos, src.first_page, src.npages, size);
++        var blobs: u64 = 0;
++        for (src.blobs) |b| blobs += b.bytes.len;
++        const charge = chargeOf(src.page, src.first_page, src.npages, src.ids.len * 4, blobs, src.families, d.opts.world);
++        const id = try d.add(src.key, src.base, src.tag, src.kind, src.pos, src.first_page, src.npages, size, charge);
+         d.stats.writes += 1;
+         d.stats.bytes_written += size;
+         return id;
+     }
+ 
+-    fn add(d: *Disk, key: Digest, base: ?Digest, tag: u32, kind: u32, pos: u64, first_page: u32, npages: u32, size: u64) !u32 {
+-        var r: Rec = .{ .key = key, .tag = tag, .kind = kind, .pos = pos, .first_page = first_page, .npages = npages, .size = size };
++    fn add(d: *Disk, key: Digest, base: ?Digest, tag: u32, kind: u32, pos: u64, first_page: u32, npages: u32, size: u64, charge: u64) !u32 {
++        var r: Rec = .{ .key = key, .tag = tag, .kind = kind, .pos = pos, .first_page = first_page, .npages = npages, .size = size, .charge = charge };
+         if (base) |b| {
+             const bi = d.by_key.get(b) orelse return error.NoBase;
+             r.base = bi;
+@@ -420,7 +459,7 @@ pub const Disk = struct {
+         if (r.base != none) d.recs.items[r.base].refs += 1;
+         d.recs.items[id] = r;
+         d.link(id);
+-        d.used += size;
++        d.used += charge;
+         return id;
+     }
+ 
+@@ -428,6 +467,7 @@ pub const Disk = struct {
+     pub const Found = struct {
+         head: Head,
+         size: u64,
++        charge: u64,
+         mtime: i64,
+         ids: []i32,
+ 
+@@ -438,7 +478,7 @@ pub const Disk = struct {
+ 
+     /// Indexes the directory on restart: .tmp files and unreadable, foreign or truncated files are deleted, every valid file's
+     /// ids are checked chunk by chunk; registered oldest first with bases before their deltas (a delta whose base is gone is deleted).
+-    pub fn scan(d: *Disk, out: *std.ArrayList(Found)) !void {
++    pub fn scan(d: *Disk, out: *std.ArrayList(Found), families: []const Family) !void {
+         var it = d.dir.iterate();
+         var nb: [48]u8 = undefined;
+         while (try it.next(d.io)) |ent| {
+@@ -451,7 +491,7 @@ pub const Disk = struct {
+                 continue;
+             }
+             if (!std.mem.endsWith(u8, name, ".tfs")) continue;
+-            const f = d.found(name) catch {
++            const f = d.found(name, families) catch {
+                 d.stats.bad += 1;
+                 _ = linux.unlinkat(d.dir.handle, name, 0);
+                 continue;
+@@ -471,12 +511,12 @@ pub const Disk = struct {
+                 _ = out.orderedRemove(i);
+                 continue;
+             }
+-            _ = try d.add(f.head.key, base, f.head.tag, f.head.kind, f.head.pos, f.head.first_page, f.head.npages, f.size);
++            _ = try d.add(f.head.key, base, f.head.tag, f.head.kind, f.head.pos, f.head.first_page, f.head.npages, f.size, f.charge);
+             i += 1;
+         }
+     }
+ 
+-    fn found(d: *Disk, name: [:0]const u8) !Found {
++    fn found(d: *Disk, name: [:0]const u8, families: []const Family) !Found {
+         const f = try d.openFile(name, false);
+         defer _ = linux.close(f.fd);
+         var lay = try d.readHead(f.fd);
+@@ -489,6 +529,12 @@ pub const Disk = struct {
+         if (linux.errno(linux.statx(f.fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true, .MTIME = true }, &st)) != .SUCCESS or st.size < h.total) return error.Truncated;
+         const seg = lay.find(.ids, "ids") orelse return error.BadHeader;
+         if (seg.nbytes % 4 != 0 or seg.nbytes / 4 != h.pos - @as(u64, h.first_page) * h.page) return error.BadHeader;
++        if (h.npages < h.first_page) return error.BadHeader;
++        var blobs: u64 = 0;
++        for (lay.segs) |s| if (s.kind == .blob) {
++            blobs += s.nbytes;
++        };
++        const charge = chargeOf(h.page, h.first_page, h.npages, seg.nbytes, blobs, families, d.opts.world);
+         const ids = try d.gpa.alloc(i32, seg.nbytes / 4);
+         errdefer d.gpa.free(ids);
+         const sb = try d.staging.get();
+@@ -502,7 +548,7 @@ pub const Disk = struct {
+             if (!std.mem.eql(u8, &dg, &lay.digests[seg.first_digest + ci])) return error.ChecksumMismatch;
+             @memcpy(std.mem.sliceAsBytes(ids)[@as(usize, ci) * seg.chunk ..][0..c.data], buf[0..c.data]);
+         }
+-        return .{ .head = h, .size = st.size, .mtime = st.mtime.sec * std.time.ns_per_s + st.mtime.nsec, .ids = ids };
++        return .{ .head = h, .size = st.size, .charge = charge, .mtime = st.mtime.sec * std.time.ns_per_s + st.mtime.nsec, .ids = ids };
+     }
+ 
+     fn link(d: *Disk, id: u32) void {
+@@ -551,7 +597,7 @@ pub const Disk = struct {
+         if (r.base != none) d.recs.items[r.base].refs -= 1;
+         d.unlink(id);
+         _ = d.by_key.remove(key);
+-        d.used -= r.size;
++        d.used -= r.charge;
+         r.live = false;
+         var nb: [48]u8 = undefined;
+         _ = linux.unlinkat(d.dir.handle, fileName(key, "tfs", &nb), 0);
+diff --git a/engine/zig/zig/src/sessions/jobs.zig b/engine/zig/zig/src/sessions/jobs.zig
+index fa1b4f1..76cf62b 100644
+--- a/engine/zig/zig/src/sessions/jobs.zig
++++ b/engine/zig/zig/src/sessions/jobs.zig
+@@ -16,6 +16,8 @@ pub const Job = struct {
+     kind: Kind,
+     /// the store's entry
+     entry: u32,
++    /// A write-through save keeps the RAM copy after the file is committed.
++    keep_ram: bool = false,
+     state: std.atomic.Value(State) = .init(.queued),
+     err: ?anyerror = null,
+     started_ns: i96 = 0,
+diff --git a/engine/zig/zig/src/sessions/prefix.zig b/engine/zig/zig/src/sessions/prefix.zig
+index 9f7191d..e5a7998 100644
+--- a/engine/zig/zig/src/sessions/prefix.zig
++++ b/engine/zig/zig/src/sessions/prefix.zig
+@@ -128,6 +128,18 @@ pub fn Index(comptime Extra: type) type {
+             return x.by_key.get(key);
+         }
+ 
++        /// Entry `id` is in the index, live or not (an index gone its own way may hold fewer ids than a plan names).
++        pub fn has(x: *const Self, id: u32) bool {
++            return id < x.entries.items.len;
++        }
++
++        /// Entry `id` is live and is the entry at `pos` with `key` (a plan's restore names the leader's entry by id).
++        pub fn holds(x: *const Self, id: u32, pos: u64, key: Digest) bool {
++            if (!x.has(id)) return false;
++            const e = &x.entries.items[id];
++            return e.live and e.pos == pos and std.mem.eql(u8, &e.key, &key);
++        }
++
+         fn newNode(x: *Self, digest: Digest, parent: u32, depth: u32) !u32 {
+             const id: u32 = if (x.free_nodes.pop()) |i| i else blk: {
+                 try x.nodes.append(x.gpa, undefined);
+diff --git a/engine/zig/zig/src/sessions/store.zig b/engine/zig/zig/src/sessions/store.zig
+index fe650b4..66e48fe 100644
+--- a/engine/zig/zig/src/sessions/store.zig
++++ b/engine/zig/zig/src/sessions/store.zig
+@@ -48,6 +48,8 @@ pub const Policy = struct {
+     delta: bool = true,
+     /// parks and restores on the tier thread (settled by the plan)
+     async_io: bool = false,
++    /// Persist each eligible saved entry before `save` returns, without evicting its RAM copy.
++    write_through: bool = false,
+ };
+ 
+ pub const Extra = struct {
+@@ -76,7 +78,12 @@ pub const Stats = struct {
+     dups: u64 = 0,
+     hits_ram: u64 = 0,
+     hits_disk: u64 = 0,
++    loaded_tokens: u64 = 0,
+     parks: u64 = 0,
++    park_failed: u64 = 0,
++    restore_failed: u64 = 0,
++    restore_crc_failed: u64 = 0,
++    restore_unfit: u64 = 0,
+     delta_parks: u64 = 0,
+     drops: u64 = 0,
+     covered_drops: u64 = 0,
+@@ -85,6 +92,12 @@ pub const Stats = struct {
+     restore_ns: u64 = 0,
+ };
+ 
++/// A family's boot-time agreement on which recovered keys every rank holds.
++pub const RecoveryFilter = struct {
++    ctx: *anyopaque,
++    keep: *const fn (ctx: *anyopaque, keys: []const Digest, mask: []bool) anyerror!void,
++};
++
+ pub const Store = struct {
+     gpa: std.mem.Allocator,
+     io: Io,
+@@ -104,9 +117,20 @@ pub const Store = struct {
+     pending: std.ArrayList(*Job) = .empty,
+     scratch: std.ArrayList(Digest) = .empty,
+     stats: Stats = .{},
++    /// Per physical page, the retained entry's maximum valid rows (0: no RAM entry holds it). This makes
++    /// `kept_tokens` exact for partial pages while pages shared with live slots or other entries count once.
++    kept_ends: []u32 = &.{},
++    kept_tokens: u64 = 0,
++    /// Python's spill tier retains the latest 4,096 completed restore latencies and drops the oldest half thereafter.
++    restore_latency_ns: [4096]u64 = @splat(0),
++    restore_latency_len: u16 = 0,
++    restore_latency: RestoreLatency = .{},
+ 
+     pub fn init(gpa: std.mem.Allocator, io: Io, pool: *Pool, pages: PageStore, d: ?*Disk, policy: Policy) !Store {
+         var s: Store = .{ .gpa = gpa, .io = io, .pool = pool, .pages = pages, .index = Index.init(gpa, pool.page), .disk = d, .policy = policy };
++        s.kept_ends = try gpa.alloc(u32, pool.npages);
++        errdefer gpa.free(s.kept_ends);
++        @memset(s.kept_ends, 0);
+         if (d) |dd| {
+             const r = try gpa.create(jobs.Runner);
+             r.* = jobs.Runner.init(gpa, io, dd);
+@@ -134,6 +158,7 @@ pub const Store = struct {
+         };
+         s.index.deinit();
+         s.scratch.deinit(s.gpa);
++        s.gpa.free(s.kept_ends);
+         s.* = undefined;
+     }
+ 
+@@ -148,6 +173,41 @@ pub const Store = struct {
+         return s.index.get(id);
+     }
+ 
++    fn entryPageTokens(s: *const Store, pos: u64, page_index: usize) u32 {
++        const start = @as(u64, @intCast(page_index)) * @as(u64, s.pool.page);
++        return @intCast(@min(@as(u64, s.pool.page), pos - start));
++    }
++
++    fn addKept(s: *Store, pages: []const u32, pos: u64) void {
++        for (pages, 0..) |pg, i| {
++            const rows = s.entryPageTokens(pos, i);
++            if (rows > s.kept_ends[pg]) {
++                s.kept_tokens += @as(u64, rows) - s.kept_ends[pg];
++                s.kept_ends[pg] = rows;
++            }
++        }
++    }
++
++    fn recomputeKeptPage(s: *Store, page: u32, skip: u32) void {
++        var rows: u32 = 0;
++        for (s.index.entries.items, 0..) |e, id| {
++            if (@as(u32, @intCast(id)) == skip or !e.live or !e.ram) continue;
++            for (e.extra.pages, 0..) |pg, i| if (pg == page) {
++                rows = @max(rows, s.entryPageTokens(e.pos, i));
++                break;
++            };
++        }
++        s.kept_tokens -= @as(u64, s.kept_ends[page]) - rows;
++        s.kept_ends[page] = rows;
++    }
++
++    fn removeKept(s: *Store, id: u32) void {
++        const e = s.index.get(id);
++        for (e.extra.pages, 0..) |pg, i| {
++            if (s.kept_ends[pg] == s.entryPageTokens(e.pos, i)) s.recomputeKeptPage(pg, id);
++        }
++    }
++
+     /// The longest stored entry (RAM or NVMe) whose ids strictly prefix prompt, with the same tag.
+     pub fn find(s: *Store, tag: u32, prompt: []const i32) !?Hit {
+         const d = try s.digests(tag, prompt);
+@@ -190,6 +250,7 @@ pub const Store = struct {
+         errdefer if (ins.new) s.index.remove(ins.id);
+         const e = s.index.get(ins.id);
+         if (e.ram) {
++            try s.persist(ins.id);
+             bounded.vtable.release(bounded.ptr);
+             s.touch(ins.id);
+             s.stats.dups += 1;
+@@ -204,11 +265,13 @@ pub const Store = struct {
+         x.bounded = bounded;
+         x.kind = kind;
+         if (slot.origin) |o| x.origin = .{ .key = o.key, .pages = @min(o.pages, @as(u32, @intCast(ids.len / s.pool.page))) };
++        s.addKept(pages, s.index.get(ins.id).pos);
+         s.bounded_total += bounded.vtable.nbytes(bounded.ptr);
+         s.ram_count += 1;
+         s.link(ins.id);
+         s.touch(ins.id);
+         s.stats.saves += 1;
++        try s.persist(ins.id);
+         try s.trimRam();
+         _ = try s.enforce();
+         return ins.id;
+@@ -306,13 +369,24 @@ pub const Store = struct {
+         return out;
+     }
+ 
++    fn persist(s: *Store, id: u32) !void {
++        if (!s.policy.write_through) return;
++        const d = s.disk orelse return;
++        if (!d.accepts(s.index.get(id).pos)) return;
++        if (try s.beginWrite(id, true)) |job| _ = try s.settle(job);
++    }
++
+     /// Starts a park of a RAM entry (null: nothing to write, the entry is already settled out of RAM).
+     pub fn beginPark(s: *Store, id: u32) !?*Job {
++        return s.beginWrite(id, false);
++    }
++
++    fn beginWrite(s: *Store, id: u32, keep_ram: bool) !?*Job {
+         const d = s.disk orelse return error.NoDisk;
+         const e = s.index.get(id);
+         if (!e.ram or e.extra.job != null) return error.NotParkable;
+         if (e.extra.file and d.get(e.key) != null) {
+-            try s.leaveRam(id);
++            if (!keep_ram) try s.leaveRam(id);
+             return null;
+         }
+         const page = s.pool.page;
+@@ -330,7 +404,7 @@ pub const Store = struct {
+             };
+         };
+         const j = try s.gpa.create(Job);
+-        j.* = .{ .kind = .park, .entry = id };
++        j.* = .{ .kind = .park, .entry = id, .keep_ram = keep_ram };
+         errdefer j.deinit(s.gpa);
+         j.ids = try s.gpa.alloc(i32, e.pos);
+         try s.index.idsOf(id, j.ids);
+@@ -360,7 +434,10 @@ pub const Store = struct {
+                 if (j.src.base) |b| d.get(b).?.refs -= 1;
+                 const e = s.index.get(j.entry);
+                 e.extra.job = null;
+-                if (j.err) |err| return err; // the entry stays in RAM; the .tmp is gone
++                if (j.err) |err| {
++                    s.stats.park_failed += 1;
++                    return err; // the entry stays in RAM; the .tmp is gone
++                }
+                 _ = try d.register(&j.src, j.size);
+                 e.extra.file = true;
+                 s.stats.parks += 1;
+@@ -372,7 +449,7 @@ pub const Store = struct {
+                     _ = try s.index.members(j.entry, &m, usedOf);
+                     for (m.items) |o| s.index.get(o).extra.covered_by = true;
+                 }
+-                try s.leaveRam(j.entry);
++                if (!j.keep_ram) try s.leaveRam(j.entry);
+                 try s.trimDisk();
+                 return null;
+             },
+@@ -380,6 +457,8 @@ pub const Store = struct {
+                 if (j.err) |err| {
+                     // the slot as before the restore (empty, its reservation kept: prod's `sl.truncate(0)`)
+                     _ = try s.pool.slots.items[j.slot].truncate(0);
++                    s.stats.restore_failed += 1;
++                    if (err == error.ChecksumMismatch) s.stats.restore_crc_failed += 1;
+                     return err;
+                 }
+                 const e = s.index.get(j.entry);
+@@ -387,7 +466,9 @@ pub const Store = struct {
+                 s.touch(j.entry);
+                 s.pool.slots.items[j.slot].origin = .{ .key = e.key, .pages = @intCast(e.pos / s.pool.page) };
+                 s.stats.hits_disk += 1;
++                s.stats.loaded_tokens += e.pos;
+                 s.stats.restore_ns += j.elapsed_ns;
++                s.recordRestoreLatency(j.elapsed_ns);
+                 const r = j.restored;
+                 j.restored = null;
+                 return r;
+@@ -395,6 +476,44 @@ pub const Store = struct {
+         }
+     }
+ 
++    fn recordRestoreLatency(s: *Store, elapsed: u64) void {
++        if (@as(usize, s.restore_latency_len) == s.restore_latency_ns.len) {
++            std.mem.copyForwards(u64, s.restore_latency_ns[0..2048], s.restore_latency_ns[2048..]);
++            s.restore_latency_len = 2048;
++        }
++        const at: usize = s.restore_latency_len;
++        s.restore_latency_ns[at] = elapsed;
++        s.restore_latency_len += 1;
++        s.restore_latency = s.calculateRestoreLatency();
++    }
++
++    /// Records a readable file whose bounded state did not match this engine's session shape.
++    pub fn restoreUnfit(s: *Store) void {
++        s.stats.restore_unfit += 1;
++    }
++
++    pub const RestoreLatency = struct { p50_ms: f64 = 0, p95_ms: f64 = 0 };
++
++    /// The p50/p95 convention matches the Python tier: sorted[int(q * n)], retaining the newest 4,096 restores.
++    pub fn restoreLatency(s: *const Store) RestoreLatency {
++        return s.restore_latency;
++    }
++
++    fn calculateRestoreLatency(s: *const Store) RestoreLatency {
++        const n: usize = s.restore_latency_len;
++        if (n == 0) return .{};
++        var times: [4096]u64 = undefined;
++        @memcpy(times[0..n], s.restore_latency_ns[0..n]);
++        std.mem.sort(u64, times[0..n], {}, std.sort.asc(u64));
++        const at = struct {
++            fn get(xs: []const u64, q: f64) f64 {
++                const i = @min(xs.len - 1, @as(usize, @intFromFloat(q * @as(f64, @floatFromInt(xs.len)))));
++                return @as(f64, @floatFromInt(xs[i])) / 1e6;
++            }
++        }.get;
++        return .{ .p50_ms = at(times[0..n], 0.5), .p95_ms = at(times[0..n], 0.95) };
++    }
++
+     /// Settles every pending job in submission order (one rank, or the plan's "settle all").
+     pub fn settleAll(s: *Store) !void {
+         while (s.pending.items.len > 0) {
+@@ -413,6 +532,7 @@ pub const Store = struct {
+     fn leaveRam(s: *Store, id: u32) !void {
+         const e = s.index.get(id);
+         if (!e.ram) return;
++        s.removeKept(id);
+         try s.pool.drop(e.extra.pages);
+         s.gpa.free(e.extra.pages);
+         e.extra.pages = &.{};
+@@ -563,15 +683,43 @@ pub const Store = struct {
+     }
+ 
+     /// Rebuilds the NVMe entries after a restart (an empty store): every valid file indexed, deltas on their bases' paths; returns how many.
+-    /// Two ranks then intersect what they hold (the engine's plan link) and drop the rest, so a plan never names an entry one rank lacks.
+-    pub fn reconcile(s: *Store) !u32 {
++    /// A boot filter drops one-sided files; logical ordering gives every rank the same entry IDs.
++    pub fn reconcile(s: *Store, filter: ?RecoveryFilter) !u32 {
+         const d = s.disk orelse return 0;
+         var found: std.ArrayList(Disk.Found) = .empty;
+         defer {
+             for (found.items) |f| s.gpa.free(f.ids);
+             found.deinit(s.gpa);
+         }
+-        try d.scan(&found);
++        try d.scan(&found, s.pool.layout.families);
++        if (filter) |f| {
++            const keys = try s.gpa.alloc(Digest, found.items.len);
++            defer s.gpa.free(keys);
++            const keep = try s.gpa.alloc(bool, found.items.len);
++            defer s.gpa.free(keep);
++            for (found.items, keys) |entry_, *key| key.* = entry_.head.key;
++            @memset(keep, true);
++            try f.keep(f.ctx, keys, keep);
++            var i = found.items.len;
++            while (i > 0) {
++                i -= 1;
++                if (!keep[i]) try d.remove(found.items[i].head.key);
++            }
++            var n: usize = 0;
++            for (found.items, keep) |entry_, yes| {
++                if (yes) {
++                    found.items[n] = entry_;
++                    n += 1;
++                } else s.gpa.free(entry_.ids);
++            }
++            found.items.len = n;
++        }
++        std.mem.sort(Disk.Found, found.items, {}, struct {
++            fn less(_: void, a: Disk.Found, b: Disk.Found) bool {
++                return a.head.pos < b.head.pos or
++                    (a.head.pos == b.head.pos and std.mem.order(u8, &a.head.key, &b.head.key) == .lt);
++            }
++        }.less);
+         for (found.items) |f| {
+             var anchor: u32 = none;
+             if (f.head.hasBase()) {
+diff --git a/engine/zig/zig/src/sessions/store_test.zig b/engine/zig/zig/src/sessions/store_test.zig
+index b2a1228..a98c6cd 100644
+--- a/engine/zig/zig/src/sessions/store_test.zig
++++ b/engine/zig/zig/src/sessions/store_test.zig
+@@ -168,7 +168,7 @@ fn restart(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32) !voi
+     var r: Rank = undefined;
+     try r.init(gpa, root, world, rank, .{ .chats = 1 });
+     defer r.deinit();
+-    try testing.expectEqual(@as(u32, 4), try r.store.reconcile());
++    try testing.expectEqual(@as(u32, 4), try r.store.reconcile(null));
+     const s = try r.pool.newSlot(64 * page);
+     const a = try chatIds(gpa, 1, 20 * page);
+     defer gpa.free(a);
+@@ -199,6 +199,38 @@ test "chats over turns: residency to NVMe, bit-identical resumes, deltas, older
+     try testing.expectEqualSlices(u64, t0.items, t1.items); // the tier thread changes when bytes move, not what is decided
+ }
+ 
++test "retained positions count shared live pages once and preserve partial-page bounds" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmpRoot(gpa, &tmp, "retained");
++    defer gpa.free(root);
++    var r: Rank = undefined;
++    try r.init(gpa, root, 1, 0, .{});
++    defer r.deinit();
++    const slot = try r.pool.newSlot(8 * page);
++    const ids = try chatIds(gpa, 7, 2 * page + 5);
++    defer gpa.free(ids);
++
++    const first = ids[0 .. page + 10];
++    try slot.ensure(first.len);
++    r.write(slot, 7, 0);
++    const first_id = (try r.store.save(slot, try HostBounded.make(gpa, 7, first.len), first, 1, 0)).?;
++    try testing.expectEqual(@as(u64, page + 10), r.store.kept_tokens);
++    _ = try slot.releaseAll();
++
++    _ = try r.store.restoreRam(first_id, slot);
++    try slot.ensure(ids.len);
++    r.write(slot, 7, 0);
++    const second_id = (try r.store.save(slot, try HostBounded.make(gpa, 7, ids.len), ids, 1, 0)).?;
++    _ = second_id;
++    // The first full page is shared; the old and copied partial pages remain distinct physical retained ranges.
++    try testing.expectEqual(@as(u64, page + 10 + page + 5), r.store.kept_tokens);
++    _ = try slot.releaseAll();
++    try r.store.drop(first_id);
++    try testing.expectEqual(@as(u64, 2 * page + 5), r.store.kept_tokens);
++}
++
+ test "two split ranks make the same decisions on the same calls and each restores its own rows" {
+     const gpa = testing.allocator;
+     var tmp = testing.tmpDir(.{});
+@@ -215,3 +247,232 @@ test "two split ranks make the same decisions on the same calls and each restore
+     try restart(gpa, root, 2, 1);
+     try testing.expectEqualSlices(u64, t0.items, t1.items);
+ }
++
++/// One rank of the trim scenario: chats of 3, 5 and 7 pages through a small tier (odd counts: the ranks' files differ).
++fn trimScenario(gpa: std.mem.Allocator, root: []const u8, world: u32, rank: u32, trace: *std.ArrayList(u64)) !void {
++    var r: Rank = undefined;
++    try r.init(gpa, root, world, rank, .{ .chats = 1, .skip_covered = false, .delta = false });
++    defer r.deinit();
++    r.disk.opts.budget = 400 << 10; // two or three of these files
++    const s = try r.pool.newSlot(64 * page);
++    var chat: u32 = 1;
++    while (chat <= 16) : (chat += 1) {
++        const ids = try chatIds(gpa, chat, (3 + 2 * (chat % 3)) * page); // 3, 5 or 7 pages
++        defer gpa.free(ids);
++        try testing.expectEqualStrings("fresh", try turn(gpa, &r, s, chat, ids));
++        try trace.appendSlice(gpa, &.{ chat, r.disk.used, r.disk.stats.evicted, r.store.stats.parks });
++        var id = r.disk.oldest;
++        while (id != disk_mod.none) : (id = r.disk.recs.items[id].newer) try trace.append(gpa, std.mem.readInt(u64, r.disk.recs.items[id].key[0..8], .little));
++        var e: u32 = 0;
++        while (e < r.store.index.entries.items.len) : (e += 1) {
++            const x = r.store.entry(e);
++            if (x.live) try trace.appendSlice(gpa, &.{ e, x.pos, @intFromBool(x.ram), @intFromBool(x.extra.file) });
++        }
++    }
++    try testing.expect(r.disk.stats.evicted >= 8); // the budget did trim, many times
++    try testing.expect(r.disk.used <= r.disk.opts.budget);
++}
++
++test "two split ranks trim the same NVMe files: the budget counts a file alike on every rank" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var t0: std.ArrayList(u64) = .empty;
++    defer t0.deinit(gpa);
++    var t1: std.ArrayList(u64) = .empty;
++    defer t1.deinit(gpa);
++    const root = try tmpRoot(gpa, &tmp, "trim");
++    defer gpa.free(root);
++    try trimScenario(gpa, root, 2, 0, &t0);
++    try trimScenario(gpa, root, 2, 1, &t1);
++    try testing.expectEqualSlices(u64, t0.items, t1.items);
++}
++
++/// Fill both ranks with the same odd-page chats, reopen the tier at its budget, and force a trim after recovery.
++fn restartTrim(gpa: std.mem.Allocator, root: []const u8, rank: u32, trace: *std.ArrayList(u64)) !u64 {
++    const policy: store_mod.Policy = .{ .chats = 1, .skip_covered = false, .delta = false, .write_through = true };
++    var charged: u64 = 0;
++    var physical: u64 = 0;
++    {
++        var r: Rank = undefined;
++        try r.init(gpa, root, 2, rank, policy);
++        defer r.deinit();
++        const slot = try r.pool.newSlot(64 * page);
++        for (1..7) |i| {
++            const chat: u32 = @intCast(i);
++            const ids = try chatIds(gpa, chat, (3 + 2 * (chat % 3)) * page);
++            defer gpa.free(ids);
++            try testing.expectEqualStrings("fresh", try turn(gpa, &r, slot, chat, ids));
++        }
++        charged = r.disk.used;
++        for (r.disk.recs.items) |rec| if (rec.live) {
++            physical += rec.size;
++        };
++    }
++    {
++        var r: Rank = undefined;
++        try r.init(gpa, root, 2, rank, policy);
++        defer r.deinit();
++        try testing.expectEqual(@as(u32, 6), try r.store.reconcile(null));
++        try testing.expectEqual(charged, r.disk.used);
++        r.disk.opts.budget = charged - 1;
++        const slot = try r.pool.newSlot(64 * page);
++        const ids = try chatIds(gpa, 7, 3 * page);
++        defer gpa.free(ids);
++        try testing.expectEqualStrings("fresh", try turn(gpa, &r, slot, 7, ids));
++        try testing.expect(r.disk.stats.evicted > 0);
++        try testing.expect(r.disk.used <= r.disk.opts.budget);
++        try trace.appendSlice(gpa, &.{ r.disk.used, r.disk.stats.evicted });
++        var id = r.disk.oldest;
++        while (id != disk_mod.none) : (id = r.disk.recs.items[id].newer) {
++            try trace.append(gpa, std.mem.readInt(u64, r.disk.recs.items[id].key[0..8], .little));
++        }
++    }
++    return physical;
++}
++
++test "recovered split ranks use the same charge and trim the same files" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmpRoot(gpa, &tmp, "restart-trim");
++    defer gpa.free(root);
++    var t0: std.ArrayList(u64) = .empty;
++    defer t0.deinit(gpa);
++    var t1: std.ArrayList(u64) = .empty;
++    defer t1.deinit(gpa);
++    const size0 = try restartTrim(gpa, root, 0, &t0);
++    const size1 = try restartTrim(gpa, root, 1, &t1);
++    try testing.expect(size0 != size1);
++    try testing.expectEqualSlices(u64, t0.items, t1.items);
++}
++
++test "holds: an entry by its id, position and key" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmpRoot(gpa, &tmp, "holds");
++    defer gpa.free(root);
++    var r: Rank = undefined;
++    try r.init(gpa, root, 1, 0, .{});
++    defer r.deinit();
++    const s = try r.pool.newSlot(64 * page);
++    const a = try chatIds(gpa, 1, 4 * page);
++    defer gpa.free(a);
++    try s.ensure(a.len);
++    r.write(s, 1, 0);
++    const id = (try r.store.save(s, try HostBounded.make(gpa, 1, a.len), a, 1, 0)).?;
++    _ = try s.releaseAll();
++    const e = r.store.entry(id);
++    var other = e.key;
++    other[0] +%= 1;
++    try testing.expect(r.store.index.holds(id, e.pos, e.key));
++    try testing.expect(!r.store.index.holds(id, e.pos - 1, e.key));
++    try testing.expect(!r.store.index.holds(id, e.pos, other));
++    try testing.expect(!r.store.index.has(id + 1000) and !r.store.index.holds(id + 1000, e.pos, e.key));
++    const pos = e.pos;
++    const key = e.key;
++    try r.store.drop(id); // out of RAM with no file: out of the index
++    try testing.expect(!r.store.index.holds(id, pos, key));
++}
++
++test "write-through persists short states without evicting RAM and reopens for byte-exact reuse" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    for ([_]bool{ false, true }) |async_io| {
++        const root = try tmpRoot(gpa, &tmp, if (async_io) "write-through-async" else "write-through-sync");
++        defer gpa.free(root);
++        const ids = try chatIds(gpa, 3, 3 * page + 5);
++        defer gpa.free(ids);
++        {
++            var r: Rank = undefined;
++            try r.init(gpa, root, 1, 0, .{ .write_through = true, .async_io = async_io, .delta = false, .ram_bytes = 1 << 20 });
++            defer r.deinit();
++            const slot = try r.pool.newSlot(8 * page);
++            try testing.expectEqualStrings("fresh", try turn(gpa, &r, slot, 3, ids[0 .. page + 10]));
++            const hit = (try r.store.find(1, ids)).?;
++            try testing.expect(hit.ram);
++            try testing.expect(r.store.entry(hit.id).extra.file);
++            try testing.expect(r.disk.get(r.store.entry(hit.id).key) != null);
++            try testing.expectEqual(@as(u64, 1), r.disk.stats.writes);
++            try testing.expectEqualStrings("ram", try turn(gpa, &r, slot, 3, ids[0 .. 2 * page + 5]));
++            try testing.expectEqual(@as(u64, 2), r.disk.stats.writes);
++        }
++        {
++            var r: Rank = undefined;
++            try r.init(gpa, root, 1, 0, .{ .write_through = true, .delta = false });
++            defer r.deinit();
++            _ = try r.store.reconcile(null);
++            const slot = try r.pool.newSlot(8 * page);
++            const hit = (try r.store.find(1, ids)).?;
++            try testing.expect(!hit.ram);
++            try testing.expectEqual(@as(u64, 2 * page + 5), hit.pos);
++            try testing.expectEqualStrings("disk", try turn(gpa, &r, slot, 3, ids));
++            try testing.expectEqual(@as(u64, hit.pos), r.store.stats.loaded_tokens);
++            const latency = r.store.restoreLatency();
++            try testing.expectEqual(latency.p50_ms, latency.p95_ms);
++            try testing.expectEqual(@as(u64, 0), r.store.stats.restore_failed);
++        }
++    }
++}
++
++test "restart recovery intersects files and assigns stable IDs despite opposite write orders" {
++    const gpa = testing.allocator;
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const root = try tmpRoot(gpa, &tmp, "common-recovery");
++    defer gpa.free(root);
++    const Digest = @import("prefix.zig").Digest;
++    var common: [2]Digest = undefined;
++    for (0..2) |rank| {
++        var r: Rank = undefined;
++        try r.init(gpa, root, 2, @intCast(rank), .{ .write_through = true, .delta = false });
++        defer r.deinit();
++        const slot = try r.pool.newSlot(8 * page);
++        const order: [3]u32 = if (rank == 0) .{ 1, 2, 3 } else .{ 2, 1, 4 };
++        for (order) |chat| {
++            const ids = try chatIds(gpa, chat, 2 * page);
++            defer gpa.free(ids);
++            _ = try turn(gpa, &r, slot, chat, ids[0 .. page + 10]);
++            if (rank == 0 and chat <= 2) {
++                const hit = (try r.store.find(1, ids)).?;
++                common[chat - 1] = r.store.entry(hit.id).key;
++            }
++        }
++    }
++    const Filter = struct {
++        fn keep(ctx: *anyopaque, keys: []const Digest, mask: []bool) anyerror!void {
++            const allowed: *const [2]Digest = @ptrCast(@alignCast(ctx));
++            for (keys, mask) |key, *yes| {
++                yes.* = std.mem.eql(u8, &key, &allowed[0]) or std.mem.eql(u8, &key, &allowed[1]);
++            }
++        }
++    };
++    var imported: [2][2]u32 = undefined;
++    for (0..2) |rank| {
++        var r: Rank = undefined;
++        try r.init(gpa, root, 2, @intCast(rank), .{ .write_through = true, .delta = false });
++        defer r.deinit();
++        try testing.expectEqual(@as(u32, 2), try r.store.reconcile(.{ .ctx = &common, .keep = Filter.keep }));
++        const slot = try r.pool.newSlot(8 * page);
++        for ([_]u32{ 1, 2 }) |chat| {
++            const ids = try chatIds(gpa, chat, 2 * page);
++            defer gpa.free(ids);
++            const hit = (try r.store.find(1, ids)).?;
++            imported[rank][chat - 1] = hit.id;
++            const job = try r.store.beginRestore(hit.id, slot);
++            var restored = (try r.store.settle(job)).?;
++            defer restored.deinit(gpa);
++            try r.check(slot, chat, hit.pos);
++            try testing.expectEqual(@as(u8, @truncate(chat *% 17 +% hit.pos)), restored.blobs[0].bytes[0]);
++            _ = try slot.releaseAll();
++        }
++        for ([_]u32{ 3, 4 }) |chat| {
++            const ids = try chatIds(gpa, chat, 2 * page);
++            defer gpa.free(ids);
++            try testing.expect((try r.store.find(1, ids)) == null);
++        }
++    }
++    try testing.expectEqualSlices(u32, &imported[0], &imported[1]);
++}

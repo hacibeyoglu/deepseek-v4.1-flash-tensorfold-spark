@@ -1,0 +1,2 @@
+# Unified patch context prefixes must retain their whitespace.
+patches/*.patch -whitespace

@@ -1,0 +1,10 @@
+DeepSeek V4.1 Flash TensorFold for Spark
+
+Runtime integration based on jayleaton/deepseek-v41-tensorfold-spark and
+0rand/deepseek-v41-tensorfold-spark, incorporating the TensorFold engine by
+ashhart and contributors. Exact revisions and modifications are recorded in
+sources.lock.json and docs/SOURCES.md.
+
+The Dockerfile and runtime patches derive from those Apache-2.0 projects.
+Fetched source exports retain their original NOTICE, LICENSE, and third-party
+license files. Model weights are downloaded separately under their own terms.

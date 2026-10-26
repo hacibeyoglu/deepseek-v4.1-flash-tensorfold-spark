@@ -1,0 +1,18 @@
+diff --git a/engine/zig/zig/src/core/direct_io.zig b/engine/zig/zig/src/core/direct_io.zig
+index 18fb3dd..d28e137 100644
+--- a/engine/zig/zig/src/core/direct_io.zig
++++ b/engine/zig/zig/src/core/direct_io.zig
+@@ -88,9 +88,11 @@ test "direct reads return the same bytes as buffered reads" {
+     const gpa = std.testing.allocator;
+     var f = try File.open("/proc/self/exe");
+     defer f.close();
+-    var plain = try File.open("/proc/self/exe");
++    // Setting File.direct=false does not clear O_DIRECT on an already-open file descriptor.
++    // Open the reference descriptor without O_DIRECT so its unaligned preads are genuinely buffered.
++    var plain: File = .{ .fd = std.c.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }), .direct = false };
++    if (plain.fd < 0) return error.FileNotFound;
+     defer plain.close();
+-    plain.direct = false;
+     const buf = try gpa.alignedAlloc(u8, .fromByteUnits(alignment), 1 << 20);
+     defer gpa.free(buf);
+     const want = try gpa.alloc(u8, 1 << 19);

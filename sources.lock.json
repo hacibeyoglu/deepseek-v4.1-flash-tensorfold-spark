@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "upstream": {
+    "url": "https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git",
+    "commit": "60b66888a1a379fb38bf85c232b27ec60b007373"
+  },
+  "fork": {
+    "url": "https://github.com/0rand/deepseek-v41-tensorfold-spark.git",
+    "commit": "305659970ae63729b0753b27dea85a7ac4b5a93b",
+    "common_base": "853310dab967480013eda7cef4e79c2fd041629a"
+  },
+  "python_reference": {
+    "url": "https://github.com/ashhart/TensorFold.git",
+    "commit": "c4646171139ee8a3c38103eaa1699dad226ec12b"
+  },
+  "patches": [
+    "patches/0001-sessions-memory-telemetry.patch",
+    "patches/0002-engram-resume-init.patch",
+    "patches/0003-direct-io-test-buffered-fd.patch"
+  ],
+  "asset_image": "nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c",
+  "huggingface_hub": "1.24.0"
+}
