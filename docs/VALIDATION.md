@@ -27,6 +27,14 @@ or GPU access. These checks did not compile the full AOT set or generate full-mo
 
 ## Reproduce
 
+The head-only download/fabric-sync change passed 54 local orchestration tests, shell checks, and the isolated
+two-node dry-run on 2026-10-26. Added checks include real rsync of small synthetic HF caches (snapshot links,
+shared blobs, same-size corruption repair, repeat transfers, and unrelated-file preservation), offline worker
+verification and receipts, insufficient disk space, and mocked fabric/SSH/Docker failures. They also check that
+only the head downloads weights and pulls the preparation image, and that copied image IDs are verified.
+No production weights/images were downloaded or transferred, and no Spark service was started for this change.
+Live fabric throughput and a fresh deployment remain unqualified. Earlier 43-test results above predate this change.
+
 ```bash
 ./scripts/test.sh
 ./stack run flash17-exl3-2.8bpw --setup --dry-run -n 192.0.2.11,192.0.2.12

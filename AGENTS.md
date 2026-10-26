@@ -8,6 +8,8 @@ Run the combined runtime host tests for runtime patches; GPU/model qualification
 Keep exact upstream/model revisions in sources.lock.json and recipes/. Preserve model and KV precision.
 Keep site identities, addresses and paths in ignored cluster.json; generated files belong in .stack/.
 Downloads use Hugging Face's normal cache, not a second model folder. Never copy Hugging Face credentials to peers.
+Download weights and pull/build images on the head only; sync to the worker over verified fabric SSH.
+Worker cache verification must remain offline. Preserve snapshot links and verify hashes/image IDs after copying.
 Preserve unrelated processes and edits. A failed or unreachable worker is unknown, not stopped.
 Never remove a container without validating this stack's ownership label. Check both ranks before mutations.
 Do not describe static checks or host tests as live model or maximum-context qualification.

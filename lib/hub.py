@@ -131,7 +131,8 @@ def download(spec):
         if not wanted or file_hash(child(original, name)) != wanted:
             raise RuntimeError(f"Engram SHA256 mismatch or missing LFS hash: {name}")
         print(f"verified original Engram shard {name}", file=sys.stderr, flush=True)
-    return {"model": model, "engram": engram, "model_files_verified": len(checked), "engram_files": files}
+    return {"model": model, "engram": engram, "model_files_verified": len(checked), "engram_files": files,
+            "engram_sha256": {name: metadata[name].lfs.sha256 for name in files}}
 
 
 if __name__ == "__main__":

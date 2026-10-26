@@ -10,12 +10,13 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
 from .config import (StackError, atomic_json, choose_network, digest, plan, read_json,
                      safe_path, ssh_target, validate_cluster)
-from . import sources
+from . import cache_sync, sources
 
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
        "-o", "ServerAliveCountMax=3"]
@@ -104,7 +105,7 @@ class Cluster:
     def request(self, rank):
         return {"node": self.nodes[rank], "recipe": self.recipe, "image": self.plan["image"],
                 "runtime": self.plan["runtime"], "asset_key": self.plan["asset_key"],
-                "asset_image": self.lock["asset_image"]}
+                "asset_image": getattr(self, "asset_image", self.lock["asset_image"])}
 
     def pair(self, action, requests=None):
         # Read both results, including failures. Never reinterpret an unreachable worker as absent.
@@ -141,11 +142,64 @@ class Cluster:
                      str(self.root / relative) + "/", peer["target"] + ":" + dest + "/"])
 
     def download(self):
+        target = self.transfer_target()
         self.sync_code()
-        requests = [{"node": n, "recipe": self.recipe, "hf_version": self.lock["huggingface_hub"]} for n in self.nodes]
-        return self.pair("download", requests)
+        head = self.remotes[0].call("download", node=self.nodes[0], recipe=self.recipe,
+                                    hf_version=self.lock["huggingface_hub"])
+        entries = cache_sync.manifest(self.nodes[0]["hub_cache"], self.recipe, head)
+        peer = self.nodes[1]
+        self.remotes[1].call("cache-prepare", cache=peer["hub_cache"], entries=entries)
+        # Explicit NUL-delimited paths preserve snapshot links and copy only their required blobs.
+        # No HF_HOME, credentials, other revisions, deletion, or in-place blob writes.
+        with tempfile.TemporaryFile() as listing:
+            listing.write(b"".join(e["path"].encode() + b"\0" for e in entries))
+            listing.seek(0)
+            sources.run(["rsync", "-a", "--protect-args", "--checksum", "--partial-dir=.rsync-partial",
+                         "--no-whole-file", "--from0", "--files-from=-", "-e", shlex.join(SSH),
+                         self.nodes[0]["hub_cache"] + "/", target + ":" + peer["hub_cache"] + "/"],
+                        stdin=listing)
+        worker = self.remotes[1].call("cache-verify", cache=peer["hub_cache"], entries=entries, receipt=head)
+        return [head, worker]
+
+    def transfer_target(self):
+        """Fail closed rather than moving large artifacts over an unverified management route."""
+        info = self.doctor()  # Both identities, current fabric, resources, and owned containers.
+        if any(s.get("running") or s["state"] == "restarting" for s in info["containers"]):
+            raise StackError("Stop this stack before syncing weights or images")
+        net = self.config["network"]
+        for rank in (0, 1):
+            self.remotes[rank].call("route", routes=[(net["nodes"][1-rank]["addresses"][0],
+                                                      net["nodes"][rank]["nic"])])
+        target = ssh_target(info["probes"][1]["username"] + "@" + net["nodes"][1]["addresses"][0])
+        peer = Remote(self.root, {**self.nodes[1], "target": target}).call("probe")
+        if peer["identity"] != self.nodes[1]["identity"]:
+            raise StackError("Fabric SSH destination identifies a different worker")
+        print(f"Bulk transfers: {target} over {net['nodes'][0]['nic']} (SSH/TCP on the RoCE fabric)", flush=True)
+        return target
+
+    def sync_image(self, image, target):
+        local = self.remotes[0].call("image", image=image)
+        # Docker archives do not preserve RepoDigests. Resolve digest references on the head,
+        # then inspect/run the immutable image ID on the worker without another registry pull.
+        reference = local["id"] if "@sha256:" in image else image
+        peer = self.remotes[1].call("image", image=reference, missing_ok=True)
+        if peer is None or peer["id"] != local["id"]:
+            saved = local["id"] if "@sha256:" in image else image
+            writer = subprocess.Popen(["docker", "save", saved], stdout=subprocess.PIPE)
+            try:
+                reader = subprocess.run([*SSH, target, "docker load"], stdin=writer.stdout)
+            finally:
+                writer.stdout.close()
+                code = writer.wait()
+            if reader.returncode or code:
+                raise StackError("Image transfer failed")
+        peer = self.remotes[1].call("image", image=reference)
+        if peer["id"] != local["id"]:
+            raise StackError("Image IDs differ after transfer")
+        return local["id"]
 
     def build(self):
+        target = self.transfer_target()
         context = sources.build_context(self.root)
         rid, image = self.plan["runtime"], self.plan["image"]
         dockerfile = str(self.root / "docker/Dockerfile")
@@ -154,32 +208,23 @@ class Cluster:
         sources.run([*common, "--label", f"io.spark-tensorfold.runtime={rid}", "-t", image, str(context)])
         sources.run(["bash", str(self.root / "scripts/check-image.sh"), image])
         self.sync_code()
-        local = self.remotes[0].call("image", image=image)
-        peer = self.remotes[1].call("image", image=image, missing_ok=True)
-        if peer is None or peer["id"] != local["id"]:
-            writer = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
-            try:
-                reader = subprocess.run([*SSH, self.nodes[1]["target"], "docker load"], stdin=writer.stdout)
-            finally:
-                writer.stdout.close()
-                code = writer.wait()
-            if reader.returncode or code: raise StackError("Image transfer failed")
-        peer = self.remotes[1].call("image", image=image)
-        if peer["id"] != local["id"]: raise StackError("Image IDs differ after transfer")
+        image_id = self.sync_image(image, target)
         self.remotes[1].call("run", argv=["bash", str(Path(self.nodes[1]["root"]) / "scripts/check-image.sh"), image])
-        atomic_json(self.root / ".stack/image.json", {"runtime": rid, "image": image, "id": local["id"]})
-        return {"image": image, "id": local["id"], "both_ranks": True}
+        atomic_json(self.root / ".stack/image.json", {"runtime": rid, "image": image, "id": image_id})
+        return {"image": image, "id": image_id, "both_ranks": True}
 
     def prepare(self):
         if any(s.get("running") or s["state"] == "restarting" for s in self.states()):
             raise StackError("Stop this stack before preparing assets; mounted assets must not change during serving")
+        target = self.transfer_target()
         sources.verify(self.root)
         self.sync_code()
         for relative in (".stack/source", ".stack/python-source"):
             self.copy_dir(relative)
         images = self.pair("image", [{"image": self.plan["image"]}] * 2)
         if images[0]["id"] != images[1]["id"]: raise StackError("Build and copy the same runtime image first")
-        self.pair("run", [{"argv": ["docker", "pull", self.lock["asset_image"]]}] * 2)
+        self.remotes[0].call("run", argv=["docker", "pull", self.lock["asset_image"]])
+        self.asset_image = self.sync_image(self.lock["asset_image"], target)
         # Each host builds its own CPU RoPE/Engram tables. Portable AOT cubins are reused on the worker.
         first = self.remotes[0].call("prepare", **self.request(0))
         self.copy_dir(f".stack/assets/{self.plan['asset_key']}/aot")

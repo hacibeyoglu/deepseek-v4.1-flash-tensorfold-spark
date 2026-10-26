@@ -34,5 +34,13 @@ Hugging Face client is pinned to 1.24.0. Exact pins live in the source lock.
 Orchestration is new code, with [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) as the workflow
 reference. Source exports retain upstream licenses, notices, and fixtures.
 
+Transfer behavior reviewed on 2026-10-26 against upstream
+[`hf-download.sh`](https://github.com/eugr/spark-vllm-docker/blob/main/hf-download.sh),
+[`build-and-copy.sh`](https://github.com/eugr/spark-vllm-docker/blob/main/build-and-copy.sh), and
+[`autodiscover.sh`](https://github.com/eugr/spark-vllm-docker/blob/main/autodiscover.sh): head downloads followed
+by cache rsync, and Docker save/load with matching-image skips. This stack uses the same approach over a
+verified direct fabric SSH destination. It limits cache copying to pinned snapshots and their required blobs,
+verifies the worker offline, and also distributes the asset-preparation image from the head.
+
 For updates, review the source diff, change the lock/patches, assemble sources, run the
 [checks](VALIDATION.md), then build and prepare under the new runtime ID. Do not reuse stale asset receipts.

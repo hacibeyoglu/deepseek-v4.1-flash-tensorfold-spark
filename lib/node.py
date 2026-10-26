@@ -267,6 +267,18 @@ def main(request):
     if action == "state": return inspect(request["name"], request["stack"], request.get("expected_env"), request.get("expected_command"))
     if action == "image": return image_id(request["image"], request.get("missing_ok", False))
     if action == "download": return download(request)
+    if action in ("cache-prepare", "cache-verify"):
+        from lib import cache_sync
+        if action == "cache-prepare":
+            result = cache_sync.prepare(request["cache"], request["entries"])
+            # An interrupted copy must not leave an older receipt authorizing startup.
+            (Path(root) / ".stack/download.json").unlink(missing_ok=True)
+            return result
+        verified = cache_sync.verify(request["cache"], request["entries"])
+        from lib.config import atomic_json
+        receipt = {**request["receipt"], **verified, "source": "head-fabric-sync"}
+        atomic_json(Path(root) / ".stack/download.json", receipt)
+        return receipt
     if action == "prepare": return prepare(request)
     if action == "check": return check_ready_files(request)
     if action == "idle":
@@ -286,7 +298,7 @@ if __name__ == "__main__":
     try:
         request = json.load(sys.stdin)
         lock = None
-        if request["action"] in ("download", "prepare", "run"):
+        if request["action"] in ("download", "prepare", "run", "cache-prepare", "cache-verify"):
             lock_path = Path(request["root"]) / ".stack/node.lock"
             lock_path.parent.mkdir(parents=True, exist_ok=True)
             lock = lock_path.open("a")
