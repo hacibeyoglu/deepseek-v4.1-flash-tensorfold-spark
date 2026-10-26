@@ -102,12 +102,13 @@ model revisions are pinned. To use another recipe, pass `--recipe path/to/recipe
 
 ```bash
 # Isolated plan: no discovery, network calls, downloads, or writes
-./stack run flash17-exl3-2.8bpw --setup --dry-run -n 192.0.2.11,192.0.2.12
+# Replace <HEAD_IP> and <WORKER_IP> with IPv4 addresses, head first.
+./stack run flash17-exl3-2.8bpw --setup --dry-run -n "<HEAD_IP>,<WORKER_IP>"
 ./stack start --dry-run             # Plan using saved cluster configuration
 
 # Apply matching overrides during preparation and startup
 ./stack prepare --context 131072 --slots 4 --pool-tokens 1000000
-./stack start --context 131072 --slots 4 --pool-tokens 1000000 --port 8100
+./stack start --context 131072 --slots 4 --pool-tokens 1000000 --port 8000
 ```
 
 Model, runtime, context, slot, or environment changes require preparation in a new asset/session namespace.
