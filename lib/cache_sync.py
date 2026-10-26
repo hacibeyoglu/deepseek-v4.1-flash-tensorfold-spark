@@ -1,6 +1,7 @@
 """Transfer only pinned snapshots and their blobs; verify peers without Hub access."""
 from __future__ import annotations
 import os
+import re
 from pathlib import Path
 import shutil
 
@@ -35,13 +36,20 @@ def manifest(cache, recipe, receipt):
     for key in ("model", "engram"):
         folder = snapshot(root, recipe[key])
         if key == "model":
-            hashes = {}
-            for line in (folder / "SHA256SUMS").read_text().splitlines():
-                if line.strip():
-                    value, name = line.split(maxsplit=1)
-                    hashes[name.lstrip("*")] = value
-            files = [p.relative_to(folder).as_posix() for p in folder.rglob("*")
-                     if p.is_file() or p.is_symlink()]
+            if recipe[key].get("verification", "sha256sums") == "hub-sha256":
+                hashes = receipt.get("model_sha256", {})
+                if (receipt.get("model") != recipe[key] or not hashes
+                        or any(not re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes.values())):
+                    raise RuntimeError("Missing or mismatched verified Hub model receipt")
+                files = list(hashes)
+            else:
+                hashes = {}
+                for line in (folder / "SHA256SUMS").read_text().splitlines():
+                    if line.strip():
+                        value, name = line.split(maxsplit=1)
+                        hashes[name.lstrip("*")] = value
+                files = [p.relative_to(folder).as_posix() for p in folder.rglob("*")
+                         if p.is_file() or p.is_symlink()]
         else:
             hashes = receipt["engram_sha256"]
             files = ["config.json", "model.safetensors.index.json", *receipt["engram_files"]]

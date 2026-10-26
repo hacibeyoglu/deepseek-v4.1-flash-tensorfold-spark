@@ -103,6 +103,18 @@ installing the download client with:
 `recipes/flash17-exl3-2.8bpw.json` holds portable model settings; `cluster.json` holds local paths and topology. Source and
 model revisions are pinned. To use another recipe, pass `--recipe path/to/recipe.json`.
 
+Two additional recipes are **experimental and await TP=2 GPU qualification**:
+
+| Recipe | Checkpoint |
+|---|---|
+| `flash17-eaq-v1-exl3-2.9bpw` | Mia EAQ v1, EXL3 2.9 bpw |
+| `flash17-libertai-exl3-2.9bpw` | LibertAI, EXL3 2.9 bpw |
+
+Use either name with `./stack run NAME --setup`. Both retain the baseline's precision, capacity, and memory
+guards; their weights are about 6.5 GiB larger in total, so memory fit still needs testing. They use pinned Hub
+hashes because these packs omit `SHA256SUMS`, and derive AOT kernel requirements from their own headers.
+The default 2.8 bpw recipe is unchanged. EAQ v1.1 and display-KV are not included.
+
 ```bash
 # Isolated plan: no discovery, network calls, downloads, or writes
 # Replace <HEAD_IP> and <WORKER_IP> with IPv4 addresses, head first.

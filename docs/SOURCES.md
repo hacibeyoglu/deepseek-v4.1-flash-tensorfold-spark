@@ -11,6 +11,8 @@ and [recipes/flash17-exl3-2.8bpw.json](../recipes/flash17-exl3-2.8bpw.json).
 | Asset Python reference | [ashhart/TensorFold `c4646171139e`](https://github.com/ashhart/TensorFold/commit/c4646171139ee8a3c38103eaa1699dad226ec12b), plus the base repository's three Python patches |
 | Served checkpoint | [jayleaton EXL3 2.8 bpw, revision `859396591c34`](https://huggingface.co/jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw/tree/859396591c340195526aaf61f94b4ad5323a5e18) |
 | Engram source | [DeepSeek original, revision `1bae0e108899`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/tree/1bae0e1088993b9b82de08f59de5be5a34e42170) |
+| Experimental EAQ v1 checkpoint | [Mia EXL3 2.9 bpw, revision `45ee5d0fd106`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw/tree/45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b) |
+| Experimental LibertAI checkpoint | [LibertAI EXL3 2.9 bpw, revision `afc7aa0aab98`](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw/tree/afc7aa0aab98ee735c0f54e0a122019af1ac08f1) |
 
 ## Runtime patches
 
@@ -21,6 +23,20 @@ and [recipes/flash17-exl3-2.8bpw.json](../recipes/flash17-exl3-2.8bpw.json).
   the locally verified repair from the previous deployment; neither public head included it.
 - **0003:** Fixes a test's reference descriptor to open without `O_DIRECT`. Changing only the wrapper's Boolean
   did not remove that OS flag. Production I/O is unchanged; the corrected host suite passed.
+- **0004:** Accepts FP16 router biases and DSpark confidence weights. Reuses direct FP16-to-FP32 widening;
+  existing FP32/BF16 behavior and unrelated tensor restrictions remain intact. Includes both-rank loader tests.
+- **0005:** Allows AOT preparation to read the selected pack's config and headers through `TF_DSV41_NEEDS_MODEL`.
+  New recipes opt in; the original recipe retains the existing width tables. Includes mixed-width planning tests.
+
+The new recipes were checked against code in
+[MiaAI-Lab's stack](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/tree/27741e176a9e5b98c10c9c7d012fd3e4fcdc19b6)
+and [0rand's Python stack](https://github.com/0rand/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark/tree/887bec7bc0a45286d0d3ae7a2ed04fd067fb9d55).
+Their engines and display-KV changes are not transplanted. All 39 EAQ and 43 LibertAI shard headers were inspected;
+each pack has 192,495 tensors. EAQ v1.1's mixed BF16 linears require separate runtime work.
+
+`model.verification` defaults to `sha256sums`. The new recipes explicitly select `hub-sha256`: the head checks
+the pinned revision, file sizes, LFS SHA256 hashes, small Git-file blob hashes, and index coverage. Verified
+SHA256 receipts accompany fabric transfers for offline worker verification. Cached checkpoint files stay unchanged.
 
 ## Build and assets
 

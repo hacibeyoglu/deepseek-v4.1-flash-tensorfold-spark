@@ -1,0 +1,112 @@
+--- a/engine/zig/zig/build/cuda.zig
++++ b/engine/zig/zig/build/cuda.zig
+@@ -295,6 +295,7 @@
+     // DSV4.1 row mode (several slots): rowtab's tables and rowmode's program over the real emitter (block.emit)
+     const rows = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/rows_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+     rows.addImport("cuda", cuda);
++    rows.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors_root.zig"), .target = host, .optimize = .debug, .link_libc = true }));
+     rows.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
+     rows.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+     const rows_run = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
+--- a/engine/zig/zig/src/families/deepseek_v41/named.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/named.zig
+@@ -56,7 +56,7 @@
+ });
+ 
+ /// The capture's name of a block group (weights.py AttnW / MoEW / EngramW fields).
+-fn groupField(g: plan.GroupPlan, gl: u32, buf: []u8) ![]const u8 {
++pub fn groupField(g: plan.GroupPlan, gl: u32, buf: []u8) ![]const u8 {
+     return switch (g.proj) {
+         .wq_a => "attn.wq_a",
+         .wkv => "attn.wkv",
+--- a/engine/zig/zig/src/families/deepseek_v41/aot_needs.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/aot_needs.zig
+@@ -619,13 +619,24 @@
+     defer arena.deinit();
+     const a = arena.allocator();
+     var w: block.Widths = .{};
+-    try check.parseDense(a, &w, @embedFile("fixtures/q28v2-dense-k2.txt"));
+-    try check.parseExperts(a, &w, @embedFile("fixtures/q28v2-expert-k2.txt"));
+-    const cfg: Config = .{};
+-    // a prefill segment's x3gm instances (the pack's per-layer K2 sets): CUDA launches, no Triton variant depends on them
+-    for (0..cfg.layers) |L| try w.gm.put(a, @intCast(L), .{ (1 << 4) | (1 << 6) | (1 << 8), (1 << 4) | (1 << 10) });
+-    // DSpark's ingest main_proj (a DSpark block's width; its EXL3 linear is CUDA, as mdraft_test.zig sets it)
+-    try w.dense.put(a, "dspark.main_proj", try w.k2("L40.attn.wkv"));
++    var cfg: Config = .{};
++    if (std.c.getenv("TF_DSV41_NEEDS_MODEL")) |path| {
++        const dir = std.mem.span(path);
++        cfg = try Config.read(a, io, dir);
++        var pack = try @import("pack.zig").Pack.open(a, io, dir);
++        defer pack.deinit();
++        var pl = try @import("plan.zig").build(a, &cfg, &pack, .{ .rank = 0, .world = 2 });
++        defer pl.deinit();
++        w = try widthsFromPlan(a, &pl, cfg.o_groups);
++        try log.print("aot-needs: widths from {s}, {d} blocks\n", .{ dir, pl.layers.len });
++    } else {
++        try check.parseDense(a, &w, @embedFile("fixtures/q28v2-dense-k2.txt"));
++        try check.parseExperts(a, &w, @embedFile("fixtures/q28v2-expert-k2.txt"));
++        // a prefill segment's x3gm instances (the pack's per-layer K2 sets): CUDA launches, no Triton variant depends on them
++        for (0..cfg.layers) |L| try w.gm.put(a, @intCast(L), .{ (1 << 4) | (1 << 6) | (1 << 8), (1 << 4) | (1 << 10) });
++        // DSpark's ingest main_proj (a DSpark block's width; its EXL3 linear is CUDA, as mdraft_test.zig sets it)
++        try w.dense.put(a, "dspark.main_proj", try w.k2("L40.attn.wkv"));
++    }
+     const sv = try Served.fromEnv();
+     try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}, pool {s}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world, if (sv.o.pool) |p| (if (p.split) "split" else "on") else "none (contiguous slot)" });
+     var n: Needs = .{ .gpa = gpa, .sigs = &parsed.value.kernels };
+@@ -768,3 +779,56 @@
+     try testing.expect(tk.of(32, 0x1000) != tk.of(1, 0x1000));
+     try testing.expect(tk.of(32, 0x1000) != tk.of(32, 0x1008));
+ }
++
++/// Same tensor names and expert ranges as the loader, without reading weight payloads.
++fn widthsFromPlan(a: std.mem.Allocator, p: *const @import("plan.zig").Plan, o_groups: u32) !block.Widths {
++    var out: block.Widths = .{};
++    for (p.layers) |*l| {
++        var buf: [32]u8 = undefined;
++        for (l.groups) |g| {
++            const field = try @import("named.zig").groupField(g, o_groups / p.world, &buf);
++            try out.dense.put(a, try std.fmt.allocPrint(a, "L{d}.{s}", .{ l.index, field }), g.full.k2());
++        }
++        var ranges: [2][2]u32 = .{ .{ 99, 0 }, .{ 99, 0 } };
++        for ([_]usize{ 0, 2, 1 }, [_]usize{ 0, 0, 1 }) |proj, slot| {
++            for (l.experts[proj].layout.words) |words| {
++                ranges[slot][0] = @min(ranges[slot][0], words / 8);
++                ranges[slot][1] = @max(ranges[slot][1], words / 8);
++            }
++            const shared = try out.k2(try std.fmt.allocPrint(a, "L{d}.moe.shared.0.{s}", .{ l.index, ([_][]const u8{ "w1", "w2", "w3" })[proj] }));
++            ranges[slot][0] = @min(ranges[slot][0], shared);
++            ranges[slot][1] = @max(ranges[slot][1], shared);
++        }
++        try out.experts.put(a, l.index, ranges);
++        var gm: [2]u32 = .{ 0, 0 };
++        for (0..2) |proj| for (l.experts[proj].layout.words) |words| {
++            gm[proj] |= @as(u32, 1) << @intCast(words / 8);
++        };
++        try out.gm.put(a, l.index, gm);
++    }
++    if (p.head) |h| try out.dense.put(a, "head", h.full.k2());
++    if (p.dspark) |d| try out.dense.put(a, "dspark.main_proj", d.main_proj.full.k2());
++    return out;
++}
++
++test "AOT widths use the selected pack, including mixed experts and DSpark" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const cfg = @import("config.zig").tiny();
++    const header = try @import("host_test.zig").tinyPack(a, &cfg, "", "");
++    var pack = @import("pack.zig").Pack.init(a);
++    defer pack.deinit();
++    try pack.addHeader("model.safetensors", header, std.math.maxInt(u32));
++    for ([_]u32{ 0, 1 }) |rank| {
++        var pl = try @import("plan.zig").build(a, &cfg, &pack, .{ .rank = rank, .world = 2 });
++        defer pl.deinit();
++        const w = try widthsFromPlan(a, &pl, cfg.o_groups);
++        try std.testing.expectEqual(@as(u32, 16), try w.k2("L2.attn.ix_wk"));
++        try std.testing.expectEqual(@as(u32, 10), try w.k2("L2.moe.shared.0.w1"));
++        try std.testing.expectEqual(@as(u32, 12), try w.k2("head"));
++        try std.testing.expectEqual(@as(u32, 8), try w.k2("dspark.main_proj"));
++        try std.testing.expectEqualDeep([2][2]u32{ .{ 4, 10 }, .{ 4, 10 } }, w.experts.get(2).?);
++        try std.testing.expectEqualDeep([2]u32{ (1 << 4) | (1 << 6), (1 << 4) | (1 << 6) }, w.gm.get(2).?);
++    }
++}

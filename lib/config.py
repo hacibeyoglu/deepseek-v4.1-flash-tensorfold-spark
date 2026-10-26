@@ -63,6 +63,8 @@ def validate_recipe(recipe):
             raise StackError(f"Invalid {kind} repository")
         if not re.fullmatch(r"[0-9a-f]{40}", model["revision"]):
             raise StackError(f"{kind} revision must be an exact 40-character commit")
+    if recipe["model"].get("verification", "sha256sums") not in ("sha256sums", "hub-sha256"):
+        raise StackError("model.verification must be sha256sums or hub-sha256")
     s = recipe["serve"]
     for key, low, high in (("port", 1024, 65535), ("context", 2048, 1048576),
                            ("slots", 1, 4), ("max_tokens", 1, 1048576),
@@ -187,6 +189,8 @@ def plan(root, recipe, cluster):
         name = f"spark-tf-{cluster['id'][:8]}-r{rank}"
         env = effective_env(recipe, cluster, rank)
         env["TF_DSV41_BIAS_VL"] = model_dir(node, recipe["model"], True)
+        if env.get("TF_DSV41_NEEDS_MODEL") == "/model":
+            env["TF_DSV41_NEEDS_MODEL"] = model_dir(node, recipe["model"], True)
         args = ["docker", "run", "--detach", "--init", "--pull=never", "--name", name,
                 "--restart", "unless-stopped", "--stop-timeout", str(recipe["serve"]["drain_seconds"] + 60),
                 "--gpus", "all", "--ipc=host", "--network", "host", "--device", "/dev/infiniband",

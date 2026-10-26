@@ -1,0 +1,198 @@
+--- a/engine/zig/build.zig
++++ b/engine/zig/build.zig
+@@ -163,6 +163,10 @@
+         .imports = &.{.{ .name = "core", .module = core }},
+     });
+     const run = b.addRunArtifact(b.addTest(.{ .root_module = family }));
++    if (b.graph.environ_map.get("TF_DSV41_HEADERS")) |dir| {
++        run.setEnvironmentVariable("TF_DSV41_HEADERS", dir);
++        run.has_side_effects = true; // Header dumps can change independently of the test binary.
++    }
+     b.step("test-dsv41", "DeepSeek-V4.1's host-side unit tests (no GPU work)").dependOn(&run.step);
+     test_step.dependOn(&run.step);
+ }
+--- a/engine/zig/zig/src/families/deepseek_v41/names.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/names.zig
+@@ -83,8 +83,10 @@
+ pub const Store = enum {
+     /// norms: bf16 in the pack (fp32 in the forward), fp32 accepted
+     norm,
+-    /// fp32 only (sinks, hc_*, router bias)
++    /// fp32 only (sinks, hc_*)
+     f32,
++    /// Router bias widens fp16 directly to fp32, without bf16 rounding.
++    router_bias,
+     /// fp16 or bf16, rounded to bf16 once (router gate, indexer weights_proj, Markov heads)
+     half,
+ 
+@@ -92,6 +94,7 @@
+         return switch (s) {
+             .norm => d == .bf16 or d == .f32,
+             .f32 => d == .f32,
++            .router_bias => d == .f32 or d == .f16,
+             .half => d == .bf16 or d == .f16,
+         };
+     }
+@@ -146,7 +149,7 @@
+     if (c.isBackbone(layer) and c.isIndexSource(layer)) try n.push(.m("attn.indexer.weights_proj.weight", .half, c.index_heads, c.hidden));
+     const ex = c.expertsOf(layer);
+     try n.push(.m("ffn.gate.weight", .half, ex.count, c.hidden));
+-    try n.push(.v("ffn.gate.bias", .f32, ex.count));
++    try n.push(.v("ffn.gate.bias", .router_bias, ex.count));
+     if (c.isEngram(layer)) {
+         try n.push(.m("engram.q_weight", .norm, hc, c.hidden));
+         try n.push(.m("engram.k_weight", .norm, hc, c.hidden));
+@@ -176,7 +179,7 @@
+     return n;
+ }
+ 
+-/// The optional confidence head: fp32 values [D + r], any shape with that many.
++/// The optional confidence head: fp32, bf16 or fp16 values [D + r], any shape with that many.
+ pub const dspark_confidence = "confidence_head.proj.weight";
+ pub const dspark_main_proj = "main_proj";
+ 
+@@ -234,3 +237,12 @@
+     try testing.expect(ignored("layers.9.ffn.gate.bias_vl", Has{}));
+     try testing.expect(Store.half.accepts(.f16) and !Store.f32.accepts(.bf16));
+ }
++
++test "FP16 router bias does not relax other native tensor types" {
++    try testing.expect(Store.router_bias.accepts(.f16));
++    try testing.expect(Store.router_bias.accepts(.f32));
++    try testing.expect(!Store.router_bias.accepts(.bf16));
++    try testing.expect(!Store.router_bias.accepts(.i16));
++    try testing.expect(!Store.f32.accepts(.f16));
++    try testing.expect(!Store.norm.accepts(.f16));
++}
+--- a/engine/zig/zig/src/families/deepseek_v41/plan.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/plan.zig
+@@ -253,7 +253,7 @@
+             const info = try b.pack.need(name);
+             var n: u64 = 1;
+             for (info.dims()) |d| n *= d;
+-            if (info.dtype != .f32 and info.dtype != .bf16 or n != b.c.hidden + b.c.dspark_markov_rank) return error.UnexpectedTensor;
++            if (info.dtype != .f32 and info.dtype != .bf16 and info.dtype != .f16 or n != b.c.hidden + b.c.dspark_markov_rank) return error.UnexpectedTensor;
+             try b.mark(name);
+             confidence = .{ .name = try b.dupe(name), .info = info, .slice = .whole, .bytes = info.nbytes };
+         }
+--- a/engine/zig/zig/src/families/deepseek_v41/host_test.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/host_test.zig
+@@ -41,13 +41,17 @@
+ }
+ 
+ /// Header JSON of a pack for `c`, named as the release packs are (their index, pattern by pattern), header only.
+-fn tinyPack(a: std.mem.Allocator, c: *const Config, extra: []const u8, skip: []const u8) ![]u8 {
++pub fn tinyPack(a: std.mem.Allocator, c: *const Config, extra: []const u8, skip: []const u8) ![]u8 {
+     var n: u64 = 0;
+     return tinyPackLen(a, c, extra, skip, &n);
+ }
+ 
+ /// `tinyPack`, and the data bytes its header describes.
+ fn tinyPackLen(a: std.mem.Allocator, c: *const Config, extra: []const u8, skip: []const u8, data_len: *u64) ![]u8 {
++    return tinyPackTypes(a, c, extra, skip, data_len, "F32", "F32");
++}
++
++fn tinyPackTypes(a: std.mem.Allocator, c: *const Config, extra: []const u8, skip: []const u8, data_len: *u64, bias: []const u8, confidence: []const u8) ![]u8 {
+     var w: std.Io.Writer.Allocating = .init(a);
+     errdefer w.deinit();
+     var at: u64 = 0;
+@@ -117,7 +121,7 @@
+             try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "{s}.engram.k_weight", .{p}), "BF16", &.{ c.hc_mult, D });
+         }
+         try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "{s}.ffn.gate.weight", .{p}), "BF16", &.{ E, D });
+-        try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "{s}.ffn.gate.bias", .{p}), "F32", &.{E});
++        try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "{s}.ffn.gate.bias", .{p}), bias, &.{E});
+         try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "{s}.ffn.gate.bias_vl", .{p}), "F32", &.{E});
+         inline for (.{ "w1", "w2", "w3" }) |m| {
+             const kn: [2]u64 = if (comptime std.mem.eql(u8, m, "w2")) .{ c.expert_width, D } else .{ D, c.expert_width };
+@@ -137,7 +141,7 @@
+     try T.group(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "mtp.{d}.main_proj", .{last}), 3 * D, D, 64);
+     inline for (.{ "main_norm", "norm" }) |s| try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "mtp.{d}." ++ s ++ ".weight", .{last}), "BF16", &.{D});
+     inline for (.{ "embed", "head" }) |s| try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "mtp.{d}.markov_head." ++ s ++ ".weight", .{last}), "BF16", &.{ c.vocab, c.dspark_markov_rank });
+-    try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "mtp.{d}.confidence_head.proj.weight", .{last}), "F32", &.{ 1, D + c.dspark_markov_rank });
++    try T.put(wr, &at, &first, skip, try std.fmt.bufPrint(&nb, "mtp.{d}.confidence_head.proj.weight", .{last}), confidence, &.{ 1, D + c.dspark_markov_rank });
+     try T.put(wr, &at, &first, skip, "vision.norm.weight", "BF16", &.{D});
+     try T.put(wr, &at, &first, skip, "image_start", "BF16", &.{D});
+     if (extra.len > 0) try T.put(wr, &at, &first, skip, extra, "BF16", &.{4});
+@@ -320,7 +324,7 @@
+     }
+     const c: Config = .{};
+     for ([_]u32{ 0, 1 }) |rank| {
+-        var pl = try plan.build(a, &c, &p, .{ .rank = rank, .world = 2, .blocks = blocks.items });
++        var pl = try plan.build(a, &c, &p, .{ .rank = rank, .world = 2, .blocks = if (blocks.items.len == 0) null else blocks.items });
+         defer pl.deinit();
+         for (pl.layers) |*l| {
+             const h = l.experts[1].layout.histogram();
+@@ -328,3 +332,72 @@
+         }
+     }
+ }
++
++test "router bias and confidence retain exact forward fp32 values on both ranks" {
++    const a = testing.allocator;
++    const io = testing.io;
++    const c = config.tiny();
++    // Includes a value that would change if fp16 were first rounded through bf16.
++    const variants = [_]struct { bias: []const u8, conf: []const u8, bits: u32, want: u32 }{
++        .{ .bias = "F32", .conf = "F32", .bits = 0x3eaaa000, .want = 0x3eaaa000 },
++        .{ .bias = "F32", .conf = "BF16", .bits = 0x3eab, .want = 0x3eab0000 },
++        .{ .bias = "F16", .conf = "F16", .bits = 0x3555, .want = 0x3eaaa000 },
++        .{ .bias = "F16", .conf = "F16", .bits = 0x0001, .want = 0x33800000 },
++        .{ .bias = "F16", .conf = "F16", .bits = 0x8000, .want = 0x80000000 },
++        .{ .bias = "F16", .conf = "F16", .bits = 0x7bff, .want = 0x477fe000 },
++        .{ .bias = "F16", .conf = "F16", .bits = 0xbc00, .want = 0xbf800000 },
++    };
++    for (variants) |v| {
++        var n: u64 = 0;
++        const json = try tinyPackTypes(a, &c, "", "", &n, v.bias, v.conf);
++        defer a.free(json);
++        var tmp = testing.tmpDir(.{});
++        defer tmp.cleanup();
++        var f = try tmp.dir.createFile(io, "model.safetensors", .{});
++        defer f.close(io);
++        var len: [8]u8 = undefined;
++        std.mem.writeInt(u64, &len, json.len, .little);
++        try f.writePositionalAll(io, &len, 0);
++        try f.writePositionalAll(io, json, 8);
++        try f.setLength(io, 8 + json.len + n);
++        const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
++        defer a.free(dir);
++        var p = try Pack.open(a, io, dir);
++        defer p.deinit();
++        for ([_][]const u8{ "layers.0.ffn.gate.bias", "mtp.1.ffn.gate.bias", "mtp.1.confidence_head.proj.weight" }) |name| {
++            const info = try p.need(name);
++            var bytes: [4]u8 = undefined;
++            if (info.dtype == .f32) {
++                std.mem.writeInt(u32, &bytes, v.want, .little);
++            } else std.mem.writeInt(u16, bytes[0..2], @intCast(v.bits), .little);
++            try f.writePositionalAll(io, bytes[0..info.dtype.size()], info.start);
++        }
++        for ([_]u32{ 0, 1 }) |rank| {
++            var pl = try plan.build(a, &c, &p, .{ .rank = rank, .world = 2 });
++            defer pl.deinit();
++            var b: named.Builder = .{ .gpa = a, .io = io, .pack = &p };
++            defer b.deinit();
++            try b.all(&pl, c.o_groups);
++            for ([_][]const u8{ "L0.moe.bias", "L9.moe.bias", "dspark.conf" }) |name| {
++                const out = b.find(name).?;
++                try testing.expectEqual(named.Kind.f32, out.kind);
++                try testing.expectEqual(v.want, std.mem.readInt(u32, out.bytes[0..4], .little));
++            }
++        }
++    }
++}
++
++test "confidence rejects integer storage and incorrect shape" {
++    const a = testing.allocator;
++    const c = config.tiny();
++    for ([_][]const u8{ "I16", "F16" }) |dtype| {
++        var n: u64 = 0;
++        const json = try tinyPackTypes(a, &c, "", "", &n, "F32", dtype);
++        defer a.free(json);
++        var p = Pack.init(a);
++        defer p.deinit();
++        try p.addHeader("model.safetensors", json, n);
++        if (std.mem.eql(u8, dtype, "F16")) p.names.getPtr("mtp.1.confidence_head.proj.weight").?.shape[1] -= 1;
++        try testing.expectError(error.UnexpectedTensor, plan.build(a, &c, &p, .{ .rank = 0, .world = 2 }));
++    }
++}

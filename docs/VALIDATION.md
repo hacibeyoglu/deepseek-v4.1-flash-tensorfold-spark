@@ -1,5 +1,31 @@
 # Validation (2026-10-26)
 
+## Experimental 2.9 bpw recipes
+
+Runtime `2c3def4c7fdda912`, tested locally on x86_64 with Zig 0.17.0:
+
+| Check | Result |
+|---|---|
+| Utilities | 69 tests passed; shell checks and isolated dry-runs passed for all three recipes |
+| Runtime host suite | Fresh cache: 103/103 build steps; 669 passed, 13 skipped, zero failures |
+| Host executable build | 30/30 steps; no CUDA fatbins or GPU execution |
+| Real checkpoint headers | All 43 layers planned on both TP=2 ranks for each pack; 47/47 loader tests passed per pack |
+| Source assembly | Both new patches applied without fuzz; assembled and tested trees match; repeat fetch verified |
+| Baseline recipe | Byte-for-byte unchanged from `main` at `a53e15a` |
+
+Tests cover FP16 widening without BF16 rounding, unchanged FP32/BF16 outputs, invalid dtype/shape rejection,
+pack-derived AOT widths, pinned Hub hashes, corruption, explicit tokens, and offline worker verification.
+Header checks used all 39 EAQ v1 and 43 LibertAI shard headers and their pinned indexes, without weight payloads.
+The local suite requires loopback sockets for synthetic transport tests. No Sparks were accessed.
+
+**Before merging:** build and prepare the candidate runtime on ARM64/GB10, qualify the original 2.8 bpw recipe
+first, then each new recipe. Verify both ranks and generation, DSpark, memory under representative concurrent
+long prompts, and actual AOT coverage. The new packs add about 6.5 GiB of weights across the pair. Host tests
+do not establish GPU kernel correctness, memory fit, maximum context, modalities, quality, or performance.
+Runtime changes create a new image and asset namespace; retain the earlier runtime for rollback.
+
+## Earlier ARM64 baseline
+
 The results below cover CPU and utility checks on two ARM64/GB10 nodes.
 **A fresh deployment from this standalone repository remains to be qualified.**
 Runtime ID: `f9361e2c7b98a65d`. Pins are in [SOURCES.md](SOURCES.md).

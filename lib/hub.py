@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -88,6 +89,47 @@ def verify_model(snapshot):
     return checked
 
 
+def verify_hub_model(snapshot, info, revision):
+    """Verify a manifest-less pack against immutable Hub metadata, on the head only."""
+    if info.sha != revision:
+        raise RuntimeError("Repository did not resolve to its pinned commit")
+    snapshot = Path(snapshot)
+    hashes = {}
+    shards = set()
+    for item in info.siblings:
+        name = item.rfilename
+        path = child(snapshot, name)
+        if not path.is_file() or path.stat().st_size != item.size:
+            raise RuntimeError(f"Missing file or size mismatch: {name}")
+        lfs = item.lfs
+        if name.endswith(".safetensors"):
+            shards.add(name)
+            if lfs is None:
+                raise RuntimeError(f"Missing LFS SHA256 for shard: {name}")
+        if lfs is not None:
+            wanted = lfs.sha256
+            if not wanted or not re.fullmatch(r"[0-9a-f]{64}", wanted) or file_hash(path) != wanted:
+                raise RuntimeError(f"Hub SHA256 mismatch or missing hash: {name}")
+            hashes[name] = wanted
+        else:
+            # Small Git files have blob SHA1 identifiers, not content SHA256 identifiers.
+            data = path.read_bytes()
+            blob = hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+            if blob != item.blob_id:
+                raise RuntimeError(f"Hub Git blob mismatch: {name}")
+            hashes[name] = hashlib.sha256(data).hexdigest()
+        print(f"verified {name}", file=sys.stderr, flush=True)
+    required = {"config.json", "tokenizer.json", "model.safetensors.index.json"}
+    if not required <= hashes.keys() or not shards:
+        raise RuntimeError("Hub metadata lacks model configuration, tokenizer, index or shards")
+    for name in required:
+        json.loads(child(snapshot, name).read_text())
+    indexed = set(json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"].values())
+    if not indexed or not indexed <= shards:
+        raise RuntimeError("Model index references unverified shards")
+    return hashes
+
+
 def engram_files(index):
     files = sorted({v for k, v in index["weight_map"].items() if ".engram.embed." in k})
     if not files:
@@ -120,7 +162,15 @@ def download(spec):
     model_path = snapshot_download(repo_id=model["repo"], revision=model["revision"], **common)
     original = snapshot_download(repo_id=engram["repo"], revision=engram["revision"],
                                  allow_patterns=["config.json", "model.safetensors.index.json", *files], **common)
-    checked = verify_model(model_path)
+    mode = model.get("verification", "sha256sums")
+    if mode == "hub-sha256":
+        model_hashes = verify_hub_model(model_path, infos[0], model["revision"])
+        checked = model_hashes
+    elif mode == "sha256sums":
+        checked = verify_model(model_path)
+        model_hashes = None
+    else:
+        raise RuntimeError(f"Unknown model verification mode: {mode}")
     info = infos[1]
     if info.sha != engram["revision"]:
         raise RuntimeError("Engram revision did not resolve to its pinned commit")
@@ -131,8 +181,11 @@ def download(spec):
         if not wanted or file_hash(child(original, name)) != wanted:
             raise RuntimeError(f"Engram SHA256 mismatch or missing LFS hash: {name}")
         print(f"verified original Engram shard {name}", file=sys.stderr, flush=True)
-    return {"model": model, "engram": engram, "model_files_verified": len(checked), "engram_files": files,
-            "engram_sha256": {name: metadata[name].lfs.sha256 for name in files}}
+    receipt = {"model": model, "engram": engram, "model_files_verified": len(checked), "engram_files": files,
+               "engram_sha256": {name: metadata[name].lfs.sha256 for name in files}}
+    if model_hashes is not None:
+        receipt["model_sha256"] = model_hashes
+    return receipt
 
 
 if __name__ == "__main__":
