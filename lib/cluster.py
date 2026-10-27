@@ -148,12 +148,12 @@ class Cluster:
                 str(self.root) + "/", peer["target"] + ":" + peer["root"] + "/"]
         sources.run(args)
 
-    def copy_dir(self, relative):
+    def copy_dir(self, relative, exclude=()):
         peer = self.nodes[1]
         dest = str(Path(peer["root"]) / relative)
         self.remotes[1].call("run", argv=["mkdir", "-p", dest])
         sources.run([*RSYNC, "--exclude=.git", "--exclude=.zig-cache", "--exclude=zig-out",
-                     "--exclude=__pycache__", "-e", shlex.join(SSH),
+                     "--exclude=__pycache__", *[f"--exclude={name}" for name in exclude], "-e", shlex.join(SSH),
                      str(self.root / relative) + "/", peer["target"] + ":" + dest + "/"])
 
     def download(self, verify_weights=False):
@@ -246,11 +246,14 @@ class Cluster:
         if images[0]["id"] != images[1]["id"]: raise StackError("Build and copy the same runtime image first")
         self.remotes[0].call("run", argv=["docker", "pull", self.lock["asset_image"]])
         self.asset_image = self.sync_image(self.lock["asset_image"], target)
-        # Each host builds its own CPU RoPE/Engram tables. Portable AOT cubins are reused on the worker.
+        # The head plans, compiles and checks shared assets once. Only packed Engram
+        # tables and the final rank receipt are local to each node.
+        print("Preparing shared assets on the head (multicore AOT planner)...", flush=True)
         first = self.remotes[0].call("prepare", **self.request(0))
-        self.copy_dir(f".stack/assets/{self.plan['asset_key']}/aot")
-        second = self.remotes[1].call("prepare", **self.request(1))
-        return [first, second]
+        self.copy_dir(f".stack/assets/{self.plan['asset_key']}", exclude=("prepared.json",))
+        print("Checking copied assets and preparing rank 1 Engram tables...", flush=True)
+        second = self.remotes[1].call("prepare", shared=first["shared"], **self.request(1))
+        return [{k: v for k, v in result.items() if k != "shared"} for result in (first, second)]
 
     def preflight(self):
         self.doctor()

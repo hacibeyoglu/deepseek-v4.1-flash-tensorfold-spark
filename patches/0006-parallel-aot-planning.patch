@@ -1,0 +1,250 @@
+--- a/engine/zig/zig/src/families/deepseek_v41/aot_needs.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/aot_needs.zig
+@@ -62,6 +62,7 @@
+     sigs: *const Sigs,
+     keys: std.StringArrayHashMapUnmanaged(u64) = .empty,
+     programs: u64 = 0,
++    workers: usize = 1,
+     /// AOTDIR given: each new variant checked against its aot.json
+     cover: ?*aot_cover.Cover = null,
+ 
+@@ -153,6 +154,124 @@
+         return std.fmt.allocPrint(a, "{{\"fn\":\"{s}\",\"function\":\"{s}\",\"consts\":{{{s}}},\"runtime\":{{{s}}}}}", .{ c.name, f.function, consts.written(), rt.written() });
+     }
+ };
++
++// Jobs own their allocators, variant maps and coverage counters. Config/widths/signatures
++// are immutable. Merge in input order so output is deterministic, including launch counts.
++fn parallel(n: *Needs, count: usize, context: anytype, comptime emit: anytype) !void {
++    if (count == 0) return;
++    const workers = @min(n.workers, count);
++    if (workers <= 1) {
++        for (0..count) |i| try emit(context, n, i);
++        return;
++    }
++    const Job = struct {
++        context: @TypeOf(context),
++        needs: Needs,
++        cover: ?aot_cover.Cover,
++        begin: usize,
++        end: usize,
++        failure: ?anyerror = null,
++        fn work(job: *@This()) void {
++            if (job.cover) |*cv| job.needs.cover = cv;
++            for (job.begin..job.end) |i| emit(job.context, &job.needs, i) catch |err| {
++                job.failure = err;
++                return;
++            };
++        }
++    };
++    const jobs = try n.gpa.alloc(Job, workers);
++    defer n.gpa.free(jobs);
++    const threads = try n.gpa.alloc(std.Thread, workers);
++    defer n.gpa.free(threads);
++    var initialized: usize = 0;
++    var started: usize = 0;
++    defer {
++        for (threads[0..started]) |thread| thread.join();
++        for (jobs[0..initialized]) |*job| {
++            job.needs.deinit();
++            if (job.cover) |*cv| cv.deinit();
++        }
++    }
++    for (jobs, 0..) |*job, i| {
++        job.* = .{
++            .context = context,
++            .needs = .{ .gpa = std.heap.smp_allocator, .sigs = n.sigs },
++            .cover = if (n.cover) |cv| .{ .gpa = std.heap.smp_allocator, .specs = cv.specs } else null,
++            .begin = count * i / workers,
++            .end = count * (i + 1) / workers,
++        };
++        initialized += 1;
++        threads[i] = try std.Thread.spawn(.{}, Job.work, .{job});
++        started += 1;
++    }
++    for (threads[0..started]) |thread| thread.join();
++    started = 0;
++    // Propagate every job failure before merging; never report partial work as success.
++    for (jobs) |job| if (job.failure) |err| return err;
++    for (jobs) |*job| {
++        for (job.needs.keys.keys(), job.needs.keys.values()) |key, launches| {
++            if (n.keys.getPtr(key)) |value| {
++                value.* += launches;
++            } else {
++                const owned = try n.gpa.dupe(u8, key);
++                n.keys.put(n.gpa, owned, launches) catch |err| {
++                    n.gpa.free(owned);
++                    return err;
++                };
++                if (n.cover) |cv| {
++                    cv.checked += 1;
++                    for (job.cover.?.missing.items) |missing| {
++                        if (std.mem.eql(u8, key, missing)) {
++                            const copy = try cv.gpa.dupe(u8, key);
++                            errdefer cv.gpa.free(copy);
++                            try cv.missing.append(cv.gpa, copy);
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++        n.programs += job.needs.programs;
++    }
++}
++
++const DecodeBatch = struct {
++    cfg: *const Config,
++    w: *const block.Widths,
++    sv: Served,
++    layers: []const u32,
++    ends: []const u64,
++    fn emit(c: @This(), n: *Needs, i: usize) !void {
++        const rows: i64 = @intCast(i + 1);
++        const ctx: Ctx = .{ .cfg = c.cfg, .w = c.w, .o = c.sv.o, .layers = c.layers, .rows = rows };
++        try scan(n, .{ .ctx = &ctx, .emit = decodeAt }, rows, c.sv.o.limit);
++        for (c.ends) |end| if (@as(i64, @intCast(end)) + 1 >= rows) {
++            var arena = std.heap.ArenaAllocator.init(n.gpa);
++            defer arena.deinit();
++            _ = try n.program(try block.emit(arena.allocator(), c.cfg, c.w, c.sv.o, c.layers, rows, @as(i64, @intCast(end)) + 1 - rows, true));
++        };
++    }
++};
++
++const PrefillBatch = struct {
++    cfg: *const Config,
++    w: *const block.Widths,
++    o: block.Options,
++    layers: []const u32,
++    start: i64,
++    fn emit(c: @This(), n: *Needs, i: usize) !void {
++        var arena = std.heap.ArenaAllocator.init(n.gpa);
++        defer arena.deinit();
++        _ = try n.program(try block_prefill.emitPrefill(arena.allocator(), c.cfg, c.w, c.o, c.layers, @intCast(i + 1), c.start, true));
++    }
++};
++
++fn workerCount() !usize {
++    const text = std.c.getenv("TF_DSV41_AOT_WORKERS") orelse return 8;
++    const count = std.fmt.parseInt(usize, std.mem.span(text), 10) catch return error.InvalidAotWorkers;
++    if (count < 1 or count > 32) return error.InvalidAotWorkers;
++    return count;
++}
+ 
+ const Const = union(enum) {
+     null,
+@@ -410,18 +529,9 @@
+     const ends = try bucketEnds(a, sv.graphs, @intCast(limit));
+     const max_rows: i64 = @max(16, cfg.dspark_block + 1);
+     // one slot: eager at every end, graphed at every bucket's end
+-    var r: i64 = 1;
+-    while (r <= max_rows) : (r += 1) {
+-        const c: Ctx = .{ .cfg = cfg, .w = w, .o = sv.o, .layers = layers, .rows = r };
+-        try scan(n, .{ .ctx = &c, .emit = decodeAt }, r, limit);
+-        for (ends) |e| if (@as(i64, @intCast(e)) + 1 >= r) {
+-            var pa = std.heap.ArenaAllocator.init(gpa);
+-            defer pa.deinit();
+-            _ = try n.program(try block.emit(pa.allocator(), cfg, w, sv.o, layers, r, @as(i64, @intCast(e)) + 1 - r, true));
+-        };
+-        try log.print("aot-needs: decode {d} rows, {d} programs, {d} variants\n", .{ r, n.programs, n.keys.count() });
+-        try log.flush();
+-    }
++    try parallel(n, @intCast(max_rows), DecodeBatch{ .cfg = cfg, .w = w, .sv = sv, .layers = layers, .ends = ends }, DecodeBatch.emit);
++    try log.print("aot-needs: decode 1..{d} rows, {d} programs, {d} variants\n", .{ max_rows, n.programs, n.keys.count() });
++    try log.flush();
+     // row mode: every bucket up to the cap at every context bucket
+     if (sv.slots > 1) {
+         var o = sv.o;
+@@ -499,12 +609,7 @@
+             if (!(try seen.getOrPut(a, f)).found_existing) try starts.append(a, s);
+         }
+         for (starts.items) |s0| {
+-            var rows: i64 = 1;
+-            while (rows <= P and s0 + rows <= limit) : (rows += 1) {
+-                var pa = std.heap.ArenaAllocator.init(gpa);
+-                defer pa.deinit();
+-                _ = try n.program(try block_prefill.emitPrefill(pa.allocator(), cfg, w, sv.o, layers, rows, s0, true));
+-            }
++            try parallel(n, @intCast(@min(P, limit - s0)), PrefillBatch{ .cfg = cfg, .w = w, .o = sv.o, .layers = layers, .start = s0 }, PrefillBatch.emit);
+             try log.print("aot-needs: prefill from {d}, {d} programs, {d} variants\n", .{ s0, n.programs, n.keys.count() });
+             try log.flush();
+         }
+@@ -575,12 +680,7 @@
+     if (sv.image_bias) o.image_rows = -1;
+     const P = sv.o.prefill_rows;
+     for (starts) |s0| {
+-        var rows: i64 = 1;
+-        while (rows <= P and s0 + rows <= sv.o.limit) : (rows += 1) {
+-            var pa = std.heap.ArenaAllocator.init(gpa);
+-            defer pa.deinit();
+-            _ = try n.program(try block_prefill.emitPrefill(pa.allocator(), cfg, w, o, layers, rows, s0, true));
+-        }
++        try parallel(n, @intCast(@min(P, sv.o.limit - s0)), PrefillBatch{ .cfg = cfg, .w = w, .o = o, .layers = layers, .start = s0 }, PrefillBatch.emit);
+     }
+     if (sv.replay) {
+         const dec = layers[try ced.decoderStart(cfg)..];
+@@ -639,7 +739,9 @@
+     }
+     const sv = try Served.fromEnv();
+     try log.print("aot-needs: limit {d}, {d} slot(s), rows cap {d}, prefill rows {d}, index budget {d} MiB, R1 {}, drafts {}, slot drafts {} (group {d}), world {d}, pool {s}\n", .{ sv.o.limit, sv.slots, sv.cap, sv.o.prefill_rows, sv.o.index_budget >> 20, sv.o.r1, sv.drafts, sv.slot_drafts, sv.group, sv.o.world, if (sv.o.pool) |p| (if (p.split) "split" else "on") else "none (contiguous slot)" });
+-    var n: Needs = .{ .gpa = gpa, .sigs = &parsed.value.kernels };
++    var n: Needs = .{ .gpa = gpa, .sigs = &parsed.value.kernels, .workers = try workerCount() };
++    try log.print("aot-needs: {d} CPU workers\n", .{n.workers});
++    try log.flush();
+     defer n.deinit();
+     const have = if (aot_dir) |d| try cuda.aot.parseSpecs(gpa, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ d, "aot.json" }), a, .limited(1 << 26))) else null;
+     defer if (have) |h| h.deinit();
+@@ -832,3 +934,53 @@
+         try std.testing.expectEqualDeep([2]u32{ (1 << 4) | (1 << 6), (1 << 4) | (1 << 6) }, w.gm.get(2).?);
+     }
+ }
++
++test "aot-needs: parallel merge preserves launches, order, programs and missing coverage" {
++    const signature =
++        \\{"kernels":{"_k":[{"function":"test._k","params":[{"name":"N","constexpr":false,"nospec":false,"noalign":false}]}]}}
++    ;
++    const parsed = try std.json.parseFromSlice(SigsJson, testing.allocator, signature, .{});
++    defer parsed.deinit();
++    const Emit = struct {
++        fn emit(_: void, n: *Needs, i: usize) !void {
++            const args = [_]calls.Named{.{ .name = "N", .arg = .{ .i = @intCast(i + 1) } }};
++            const cs = [_]calls.Call{.{ .triton = true, .name = "_k", .args = &args }};
++            _ = try n.program(&cs);
++        }
++    };
++    var serial: Needs = .{ .gpa = testing.allocator, .sigs = &parsed.value.kernels };
++    defer serial.deinit();
++    var serial_cover: aot_cover.Cover = .{ .gpa = testing.allocator, .specs = &.{} };
++    defer serial_cover.deinit();
++    serial.cover = &serial_cover;
++    try parallel(&serial, 129, {}, Emit.emit);
++    for ([_]usize{ 2, 4, 8, 32 }) |workers| {
++        var multi: Needs = .{ .gpa = testing.allocator, .sigs = &parsed.value.kernels, .workers = workers };
++        defer multi.deinit();
++        var cover: aot_cover.Cover = .{ .gpa = testing.allocator, .specs = &.{} };
++        defer cover.deinit();
++        multi.cover = &cover;
++        try parallel(&multi, 129, {}, Emit.emit);
++        try testing.expectEqual(serial.programs, multi.programs);
++        try testing.expectEqual(serial.keys.count(), multi.keys.count());
++        try testing.expectEqualSlices(u64, serial.keys.values(), multi.keys.values());
++        for (serial.keys.keys(), multi.keys.keys()) |a, b| try testing.expectEqualStrings(a, b);
++        try testing.expectEqual(serial_cover.checked, cover.checked);
++        try testing.expectEqual(serial_cover.missing.items.len, cover.missing.items.len);
++        for (serial_cover.missing.items, cover.missing.items) |a, b| try testing.expectEqualStrings(a, b);
++    }
++}
++
++test "aot-needs: parallel errors are joined and propagated without a partial merge" {
++    const sigs: Sigs = .{};
++    var n: Needs = .{ .gpa = testing.allocator, .sigs = &sigs, .workers = 8 };
++    defer n.deinit();
++    const Emit = struct {
++        fn emit(_: void, nd: *Needs, i: usize) !void {
++            if (i == 3) return error.TestJobFailure;
++            _ = try nd.program(&.{});
++        }
++    };
++    try testing.expectError(error.TestJobFailure, parallel(&n, 100, {}, Emit.emit));
++    try testing.expectEqual(@as(u64, 0), n.programs);
++}

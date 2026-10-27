@@ -28,6 +28,14 @@ and [recipes/flash17-exl3-2.8bpw.json](../recipes/flash17-exl3-2.8bpw.json).
 - **0005:** Allows AOT preparation to read the selected pack's config and headers through `TF_DSV41_NEEDS_MODEL`.
   New recipes opt in; the original recipe retains the existing width tables. Includes mixed-width planning tests.
 
+- **0006:** Parallelizes independent AOT decode scans and prefill row enumeration with bounded CPU
+  workers and per-thread variant/coverage state. Results merge deterministically; failures propagate after
+  joining workers. Adaptive scans retain their original boundaries and numerical kernels are unchanged.
+  The head distributes shared tables and verified cubins; the worker validates their hashes and still
+  packs/checks rank-specific Engram data. AOT enumeration consumes the shared serving settings and TP
+  world size, not TP rank; the existing model-derived width plan already uses rank 0 on both nodes.
+  RoPE and Engram host lookup generators take only the shared model config/tokenizer.
+
 The new recipes were checked against code in
 [MiaAI-Lab's stack](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/tree/27741e176a9e5b98c10c9c7d012fd3e4fcdc19b6)
 and [0rand's Python stack](https://github.com/0rand/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark/tree/887bec7bc0a45286d0d3ae7a2ed04fd067fb9d55).

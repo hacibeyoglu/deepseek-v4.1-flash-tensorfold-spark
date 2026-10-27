@@ -90,6 +90,19 @@ and can take time even when the cache is already populated. API readiness and ge
 image IDs skip transfer, and both sides' IDs are checked afterward. Preparation runs by the resolved image ID
 because Docker archives do not preserve registry digest references.
 
+Shared assets are prepared on the head only: AOT requirement enumeration and coverage checking use
+**eight CPU workers** for independent decode scans and prefill rows. The head compiles the Triton kernels,
+generates RoPE and Engram host lookup tables, then copies those assets over fabric SSH. The worker checks
+the runtime/asset identity and SHA256 of every shared file (including cubins) against the head's receipt;
+it does not repeat AOT enumeration, compilation, or shared table generation. Each rank still packs and
+checks its own Engram files. These small/generated-asset hashes do not hash the model weights.
+
+For serial diagnostics, set `TF_DSV41_AOT_WORKERS` to `"1"` in a custom recipe's `env`; valid values are
+1–32, with 8 as the runtime default. This controls CPU planning only, not inference precision or GPU
+parallelism. Adaptive regime discovery and some replay checks remain serial; speedup depends on CPU
+and workload. After updating runtime patches, use `./stack fetch`, `./stack build`, and `./stack prepare`
+with the stack stopped; the changed runtime gets a new asset namespace. Existing runs are not modified.
+
 Both bulk paths verify node identity and routing over the saved RoCE interfaces, and fail if fabric SSH is
 unavailable instead of falling back to management Ethernet. These are **SSH/TCP transfers over the RoCE
 network**, not RDMA file transfers; they use one fabric lane. Run these stages with this stack stopped.

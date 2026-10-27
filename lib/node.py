@@ -158,11 +158,52 @@ def download(request):
     return verified
 
 
+SHARED_ASSETS = ("sigs.json", "needs.json", "checked-needs.json", "rope.bin", "engram-host.bin", "aot/aot.json")
+
+
+def asset_hash(path):
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def shared_hashes(assets):
+    manifest = json.loads((assets / "aot/aot.json").read_text())
+    names = list(SHARED_ASSETS)
+    for kernel in manifest["kernels"]:
+        value = kernel["hash"]
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise RuntimeError("Invalid AOT cubin hash")
+        names.append(f"aot/cubins/{value}.cubin")
+    return {name: asset_hash(assets / name) for name in sorted(set(names))}
+
+
+def verify_shared(assets, shared, request):
+    identity = {"runtime": request["runtime"], "asset_key": request["asset_key"]}
+    if shared.get("identity") != identity:
+        raise RuntimeError("Head assets belong to another runtime/recipe")
+    # Enumerate from the received AOT manifest, then compare to the head's receipt
+    # carried over the control channel. A missing/changed cubin cannot be accepted.
+    hashes = shared_hashes(assets)
+    if hashes != shared.get("hashes"):
+        raise RuntimeError("Copied assets differ from the head's verified assets")
+    return hashes
+
+
 def prepare(request):
     from lib.config import atomic_json, model_dir
     node, recipe, image = request["node"], request["recipe"], request["image"]
     make_paths(node)
     assets, engram = Path(node["paths"]["assets"]), Path(node["paths"]["engram"])
+    shared = request.get("shared")
+    if node["rank"] == 1:
+        if shared is None:
+            raise RuntimeError("Worker preparation requires verified head assets")
+        verify_shared(assets, shared, request)
+    elif shared is not None:
+        raise RuntimeError("Only the worker may consume shared head assets")
     model = model_dir(node, recipe["model"], True)
     original = model_dir(node, recipe["engram"], True)
     if not snapshot(node["hub_cache"], recipe["model"]).is_dir(): raise RuntimeError("Run ./stack download first")
@@ -186,7 +227,7 @@ def prepare(request):
     stamp = assets / "prepared.json"
     wanted = {"runtime": request["runtime"], "asset_key": request["asset_key"], "rank": node["rank"]}
     complete = stamp.exists() and json.loads(stamp.read_text()).get("identity") == wanted
-    if not complete:
+    if node["rank"] == 0 and not complete:
         run(tool + [prefix + "triton_fill.py", "sigs", "--py", py, "--out", "/assets/sigs.json"])
         run(docker_base(node, image) + ["aot-needs", "/assets/sigs.json", "/assets/needs.json"])
         fill = [prefix + "triton_fill.py", "compile", "--py", py, "--needs", "/assets/needs.json",
@@ -198,11 +239,15 @@ def prepare(request):
         run(tool + [prefix + "dsv41_engram_host.py", "--py-src", py, "--config", model + "/config.json",
                     "--tokenizer", model + "/tokenizer.json", "--out", "/assets/engram-host.bin"])
     shutil.copyfile(Path(node["root"]) / ".stack/source/config/pfdense-table.json", Path(node["paths"]["cache"]) / "pfdense-table.json")
-    run(docker_base(node, image) + ["aot-needs", "/assets/sigs.json", "/assets/checked-needs.json", "/assets/aot"])
-    hashes = {name: hashlib.sha256((assets / name).read_bytes()).hexdigest()
-              for name in ("sigs.json", "rope.bin", "engram-host.bin", "aot/aot.json")}
+    if node["rank"] == 0:
+        run(docker_base(node, image) + ["aot-needs", "/assets/sigs.json", "/assets/checked-needs.json", "/assets/aot"])
+        hashes = shared_hashes(assets)
+        shared = {"identity": {"runtime": request["runtime"], "asset_key": request["asset_key"]}, "hashes": hashes}
+    else:
+        hashes = verify_shared(assets, shared, request)
     atomic_json(stamp, {"identity": wanted, "hashes": hashes})
-    return {"prepared": str(assets), "aot": "coverage passed", "engram": "header, size and sampled rows passed"}
+    return {"prepared": str(assets), "aot": "coverage passed" if node["rank"] == 0 else "head coverage and copied hashes verified",
+            "engram": "header, size and sampled rows passed", "shared": shared}
 
 
 def check_ready_files(request):
@@ -212,7 +257,7 @@ def check_ready_files(request):
     if marker["identity"] != {"runtime": request["runtime"], "asset_key": request["asset_key"], "rank": node["rank"]}:
         raise RuntimeError("Prepared assets do not match this runtime/recipe/rank; run ./stack prepare")
     for name, expected in marker["hashes"].items():
-        if hashlib.sha256((assets / name).read_bytes()).hexdigest() != expected:
+        if asset_hash(assets / name) != expected:
             raise RuntimeError(f"Asset hash mismatch: {name}; run ./stack prepare")
     manifest = json.loads((assets / "aot/aot.json").read_text())
     for kernel in manifest["kernels"]:

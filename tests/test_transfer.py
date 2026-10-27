@@ -222,6 +222,8 @@ class OrchestrationTransferTests(unittest.TestCase):
         self.c.copy_dir = Mock()
         self.c.pair = Mock(return_value=[{'id': 'same'}] * 2)
         self.c.sync_image = Mock(return_value='sha256:asset')
+        self.c.remotes[0].call.return_value = {'shared': {'identity': 'fixture'}}
+        self.c.remotes[1].call.return_value = {'aot': 'verified'}
         with patch('lib.cluster.sources.verify'):
             self.c.prepare()
         head_calls = self.c.remotes[0].call.call_args_list
@@ -229,3 +231,6 @@ class OrchestrationTransferTests(unittest.TestCase):
         self.assertEqual(head_calls[1].kwargs['asset_image'], 'sha256:asset')
         self.assertEqual([c.args[0] for c in self.c.remotes[1].call.call_args_list], ['prepare'])
         self.assertEqual(self.c.remotes[1].call.call_args.kwargs['asset_image'], 'sha256:asset')
+
+        self.assertEqual(self.c.remotes[1].call.call_args.kwargs['shared'], {'identity': 'fixture'})
+        self.c.copy_dir.assert_called_with(f".stack/assets/{self.c.plan['asset_key']}", exclude=('prepared.json',))
