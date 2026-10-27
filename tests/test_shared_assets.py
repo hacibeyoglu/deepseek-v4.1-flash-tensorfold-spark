@@ -77,3 +77,18 @@ class SharedAssetsTests(unittest.TestCase):
         (self.assets / f'aot/cubins/{self.cubin}.cubin').unlink()
         with self.assertRaises(FileNotFoundError):
             node.verify_shared(self.assets, self.shared, self.request)
+
+    def test_cached_head_corruption_is_not_recertified_or_shared(self):
+        head = {**self.request['node'], 'rank': 0}
+        request = {**self.request, 'node': head}
+        for layer in (1, 14):
+            (Path(head['paths']['engram']) / f'engram-l{layer}-r0of2.bin').write_bytes(b'packed')
+        marker = {'identity': {**self.shared['identity'], 'rank': 0}, 'hashes': self.shared['hashes']}
+        stamp = self.assets / 'prepared.json'
+        stamp.write_text(json.dumps(marker))
+        (self.assets / 'rope.bin').write_bytes(b'corrupt')
+        with patch('lib.node.run', return_value=Mock(returncode=0)) as run:
+            with self.assertRaisesRegex(RuntimeError, 'Cached head asset changed'):
+                node.prepare(request)
+        self.assertFalse(any('aot-needs' in c.args[0] for c in run.call_args_list))
+        self.assertEqual(json.loads(stamp.read_text()), marker)

@@ -1,5 +1,33 @@
 # Validation (2026-10-26)
 
+## Multicore head preparation (2026-10-26)
+
+Runtime `40776fc247332549` adds patch 0006. Shared AOT planning/checking uses eight CPU workers on
+the head; the worker consumes head-generated assets with full generated-file SHA256 validation.
+Rank-specific Engram packing/checks remain local. Model and KV precision are unchanged.
+
+- 78 orchestration tests passed, including no worker enumeration/compilation, rank-local Engram checks,
+  copied cubin/table corruption, missing cubins, wrong runtime identity, missing head receipts, and
+  refusing to recertify corrupted cached head assets.
+- The optimized host executable build passed all 30 steps. The combined host suite passed all 102
+  steps (179 tests executed successfully, five skipped; other test results reused the build cache).
+  The first sandboxed run encountered blocked local sockets; the successful rerun allowed loopback.
+- Thread merge tests compare serial with 2/4/8/32 workers, including variant order, per-variant launch
+  counts, program counts, missing coverage, and joining/propagating a failed worker without partial success.
+- Full 1,048,576-token, four-slot baseline: the eight-worker output exactly matches the original head's
+  serial JSON: 343,978 programs, 144 variants, identical variant order and every launch count. Coverage
+  passed against the head's existing 144-variant AOT manifest. Recipe and signature file SHA256 matched
+  across the reference and test inputs. The local x86_64 pass took 282.5 seconds; no comparable serial
+  timing was completed locally, so this is not a measured Spark speedup. A redundant local serial run
+  was stopped after retrieving the head's completed original serial reference.
+- Fresh source assembly applied the full patch set without fuzz, matched the tested source, and passed
+  repeat-fetch verification. Shell checks and isolated synthetic-node launch generation passed.
+
+This is CPU preparation validation, not GPU inference or an end-to-end startup benchmark. This validation
+did not deploy to the Sparks or interrupt their ongoing setup. Raw local evidence is in
+`.stack/parallel-python-final.log`, `.stack/parallel-build.log`, `.stack/parallel-host-allowed.log`,
+`.stack/parallel-fetch.log`, `.stack/parallel-covered.log`, and `.stack/parallel-equivalence.json`.
+
 ## Experimental 2.9 bpw recipes
 
 Runtime `2c3def4c7fdda912`, tested locally on x86_64 with Zig 0.17.0:

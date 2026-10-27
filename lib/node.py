@@ -226,7 +226,12 @@ def prepare(request):
     run(tool + [packer, *pack_args, "--check", "/engram"])
     stamp = assets / "prepared.json"
     wanted = {"runtime": request["runtime"], "asset_key": request["asset_key"], "rank": node["rank"]}
-    complete = stamp.exists() and json.loads(stamp.read_text()).get("identity") == wanted
+    previous = json.loads(stamp.read_text()) if stamp.exists() else {}
+    complete = previous.get("identity") == wanted
+    if node["rank"] == 0 and complete:
+        for name, expected in previous["hashes"].items():
+            if asset_hash(assets / name) != expected:
+                raise RuntimeError(f"Cached head asset changed: {name}; restore or regenerate these assets")
     if node["rank"] == 0 and not complete:
         run(tool + [prefix + "triton_fill.py", "sigs", "--py", py, "--out", "/assets/sigs.json"])
         run(docker_base(node, image) + ["aot-needs", "/assets/sigs.json", "/assets/needs.json"])
