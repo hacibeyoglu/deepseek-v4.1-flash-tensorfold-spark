@@ -2,6 +2,7 @@
 
 Code and checkpoint metadata checked on 2026-10-26. Full pins are in [sources.lock.json](../sources.lock.json)
 and [recipes/flash17-exl3-2.8bpw.json](../recipes/flash17-exl3-2.8bpw.json).
+Serving defaults, source-to-runtime mappings and deliberate differences are in [recipe settings](RECIPE-SETTINGS.md).
 
 | Component | Source |
 |---|---|

@@ -92,6 +92,46 @@ class ConfigTests(unittest.TestCase):
         self.recipe["model"]["revision"] = "a" * 40
         self.assertNotEqual(first["asset_key"], plan(ROOT, self.recipe, self.cluster)["asset_key"])
 
+    def test_sampling_defaults_reach_server_without_invalidating_kernels(self):
+        before = plan(ROOT, self.recipe, self.cluster)
+        self.recipe["serve"].update(temperature=0.4, top_p=1.0, top_k=0)
+        validate_recipe(self.recipe)
+        after = plan(ROOT, self.recipe, self.cluster)
+        self.assertEqual(before["asset_key"], after["asset_key"])
+        for flag, value in (("--temperature", "0.4"), ("--top-p", "1.0"), ("--top-k", "0")):
+            command = after["nodes"][0]["command"]
+            self.assertEqual(command[command.index(flag) + 1], value)
+            self.assertNotIn(flag, after["nodes"][1]["command"])
+            self.assertNotIn(flag, before["nodes"][0]["command"])
+        for old, new in zip(before["nodes"], after["nodes"]):
+            old_labels = [x for x in old["command"] if x.startswith("io.spark-tensorfold.config=")]
+            new_labels = [x for x in new["command"] if x.startswith("io.spark-tensorfold.config=")]
+            self.assertNotEqual(old_labels, new_labels)
+
+    def test_sampling_rejects_invalid_values(self):
+        for key, value in (("temperature", float("nan")), ("temperature", float("inf")),
+                           ("temperature", -0.1), ("temperature", True),
+                           ("top_p", 0), ("top_p", 1.01), ("top_p", "0.95"),
+                           ("top_k", -1), ("top_k", 1.5), ("top_k", True), ("top_k", 2**32)):
+            recipe = copy.deepcopy(self.recipe)
+            recipe["serve"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(StackError):
+                validate_recipe(recipe)
+
+    def test_eight_slots_reach_both_ranks_and_get_fresh_assets(self):
+        before = plan(ROOT, self.recipe, self.cluster)
+        self.recipe["serve"]["slots"] = 8
+        validate_recipe(self.recipe)
+        after = plan(ROOT, self.recipe, self.cluster)
+        self.assertNotEqual(before["asset_key"], after["asset_key"])
+        for rank in after["nodes"]:
+            self.assertEqual(rank["env"]["TF_DSV41_SLOTS"], "8")
+        command = after["nodes"][0]["command"]
+        self.assertEqual(command[command.index("--parallel") + 1], "8")
+        self.recipe["serve"]["slots"] = 9
+        with self.assertRaises(StackError):
+            validate_recipe(self.recipe)
+
     def test_no_precision_change_or_disabled_memory_guard(self):
         env = self.recipe["env"]
         self.assertEqual(env["TF_DSV41_INDEX_KV"], "fp8")

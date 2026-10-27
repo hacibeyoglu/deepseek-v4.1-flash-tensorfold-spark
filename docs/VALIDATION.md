@@ -1,5 +1,25 @@
 # Validation (2026-10-26)
 
+## Origin-matched serving profiles (2026-10-26)
+
+The [recipe settings audit](RECIPE-SETTINGS.md) records pinned source launchers, model cards, native
+environment readers and the mappings used. The two 2.9 bpw recipes now use their source stacks' serving
+choices instead of inheriting the entire 2.8 bpw profile. The baseline's SSD budget/minimum entry size
+now match its source environment; earlier claims below that its recipe was unchanged are historical.
+
+- `./scripts/test.sh`: 81 tests passed, plus shell syntax checks and the isolated baseline dry-run.
+- Separate `./stack run NAME --setup --dry-run -n 192.0.2.11,192.0.2.12` checks passed for all three recipes.
+  Both ranks receive the same slot count and unchanged FP8 index precision; the head receives the intended
+  sampling flags. Distinct model/profile combinations produce distinct asset namespaces.
+- New command-generation tests cover eight-slot propagation to both ranks, sampling defaults including
+  top-k zero, configuration-label changes, unchanged kernel identity for sampling-only changes, and invalid
+  sampling values. Existing checkpoint/cache, transfer, cancellation and lifecycle tests also passed.
+
+No runtime source or patch was changed. These checks did not access either Spark, prepare GPU kernels,
+download weights, deploy, or run generation. GPU memory fit, AOT coverage, eight-slot operation and
+performance of the translated profiles remain unqualified. Prepare fresh assets with the selected recipe
+before starting it; retain the previous assets/runtime for recovery.
+
 ## Multicore head preparation (2026-10-26)
 
 Runtime `40776fc247332549` adds patch 0006. Shared AOT planning/checking uses eight CPU workers on

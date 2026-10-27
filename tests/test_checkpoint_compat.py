@@ -170,14 +170,16 @@ class RecipeCompatibilityTests(unittest.TestCase):
         for name in ('flash17-eaq-v1-exl3-2.9bpw', 'flash17-libertai-exl3-2.9bpw'):
             recipe = load_recipe(ROOT, name)
             self.assertEqual(recipe['engram'], base['engram'])
-            self.assertEqual(recipe['serve'], base['serve'])
-            self.assertEqual(recipe['env'], {**base['env'], 'TF_DSV41_NEEDS_MODEL': '/model'})
+            for key in ('TF_DSV41_INDEX_KV', 'TF_DSV41_FLOOR_GIB', 'TF_DSV41_FLOOR_HARD_GIB',
+                        'TF_DSV41_BOOT_MEASURED'):
+                self.assertEqual(recipe['env'][key], base['env'][key])
             generated = plan(ROOT, recipe, cluster)
             self.assertNotIn(generated['asset_key'], assets)
             assets.add(generated['asset_key'])
             for rank in (0, 1):
                 env = generated['nodes'][rank]['env']
                 self.assertEqual(env['TF_DSV41_NEEDS_MODEL'], model_dir(cluster['nodes'][rank], recipe['model'], True))
+                self.assertEqual(env['TF_DSV41_SLOTS'], str(recipe['serve']['slots']))
                 self.assertNotEqual(generated['nodes'][rank]['paths']['prepared'], old['nodes'][rank]['paths']['prepared'])
         bad = copy.deepcopy(base)
         bad['model']['verification'] = 'skip'

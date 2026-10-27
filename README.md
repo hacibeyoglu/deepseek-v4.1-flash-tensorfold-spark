@@ -1,10 +1,6 @@
 # DeepSeek V4.1 Flash TensorFold for Spark
 
-**Acknowledgements:** Thanks to these projects and their contributors:
-
-- [jayleaton/deepseek-v41-tensorfold-spark](https://github.com/jayleaton/deepseek-v41-tensorfold-spark): runtime integration, model tooling, and Docker build foundation.
-- [0rand/deepseek-v41-tensorfold-spark (pr65-flash17-serving)](https://github.com/0rand/deepseek-v41-tensorfold-spark/tree/pr65-flash17-serving): session persistence, memory handling, and telemetry improvements.
-- [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker): workflow reference for head-managed workers and recipe utilities.
+**Acknowledgements:** This project builds on the wonderful work of [ashhart/TensorFold](https://github.com/ashhart/TensorFold), [jayleaton](https://github.com/jayleaton/deepseek-v41-tensorfold-spark), [0rand](https://github.com/0rand/deepseek-v41-tensorfold-spark/tree/pr65-flash17-serving), and [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker).
 
 A two-Spark stack for **DeepSeek-V4.1-Flash-1017 EXL3 2.8 bpw**, using TensorFold's native Zig/CUDA runtime.
 **TP=2 (tensor parallelism): two nodes with one GB10 GPU each, one head and one worker.**
@@ -133,10 +129,13 @@ Two additional recipes are **experimental and await TP=2 GPU qualification**:
 | `flash17-eaq-v1-exl3-2.9bpw` | Mia EAQ v1, EXL3 2.9 bpw |
 | `flash17-libertai-exl3-2.9bpw` | LibertAI, EXL3 2.9 bpw |
 
-Use either name with `./stack run NAME --setup`. Both retain the baseline's precision, capacity, and memory
-guards; their weights are about 6.5 GiB larger in total, so memory fit still needs testing. They use pinned Hub
-hashes because these packs omit `SHA256SUMS`, and derive AOT kernel requirements from their own headers.
-The default 2.8 bpw recipe is unchanged. EAQ v1.1 and display-KV are not included.
+Use either name with `./stack run NAME --setup`. Their serving settings follow their pinned source stacks:
+both use 2K prefill, a shared 1,048,576-position replicated KV pool and full expert top-k routing; EAQ has four
+slots and RAM-only session reuse, while LibertAI has eight slots and a 32-GiB SSD session tier. Sampling defaults
+also differ. See [recipe settings and origin mappings](docs/RECIPE-SETTINGS.md) for exact values and runtime limits.
+Both preserve the existing precision and memory guards. Their weights are about 6.5 GiB larger in total, so
+memory fit still needs testing. They use pinned Hub hashes because these packs omit `SHA256SUMS`, and derive AOT
+kernel requirements from their own headers. EAQ v1.1 and display-KV are not included.
 
 ```bash
 # Isolated plan: no discovery, network calls, downloads, or writes
@@ -150,11 +149,14 @@ The default 2.8 bpw recipe is unchanged. EAQ v1.1 and display-KV are not include
 ```
 
 Model, runtime, context, slot, or environment changes require preparation in a new asset/session namespace.
-Stop the stack before preparation. Port/host changes only require recreation. The recipe controls runtime
+Stop the stack before preparation. Port/host and sampling-default changes only require recreation. Optional
+`serve.temperature`, `serve.top_p`, and `serve.top_k` become server defaults; requests can override them.
+The recipe controls runtime
 variables; shell-exported TensorFold settings are not used.
 
-Defaults: four slots, 1,048,576 context per request, a **shared 2.1M-token KV pool**, FP8 index KV, expert top-p
-`0.85`, DSpark, native images, structured output, and a 32-GiB SSD session tier with immediate write-through.
+Default 2.8 bpw profile: four slots, 1,048,576 context per request, a **shared 2.1M-token KV pool**, FP8 index KV,
+expert top-p `0.85`, DSpark, native images, structured output, and a 128-GiB SSD session tier with immediate
+write-through for entries of at least 1024 tokens, matching the source environment's budget and minimum size.
 Memory checks retain the 5-GiB admission floor, 4-GiB hard floor, 3.5-GiB prefill reserve, measured boot guard,
 and 4K-to-2K prefill fallback. The launcher does not silently change precision or capacity.
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -67,7 +68,7 @@ def validate_recipe(recipe):
         raise StackError("model.verification must be sha256sums or hub-sha256")
     s = recipe["serve"]
     for key, low, high in (("port", 1024, 65535), ("context", 2048, 1048576),
-                           ("slots", 1, 4), ("max_tokens", 1, 1048576),
+                           ("slots", 1, 8), ("max_tokens", 1, 1048576),
                            ("ready_timeout", 1, 86400), ("drain_seconds", 1, 3600)):
         if type(s[key]) is not int or not low <= s[key] <= high:
             raise StackError(f"serve.{key} must be an integer in [{low}, {high}]")
@@ -75,6 +76,14 @@ def validate_recipe(recipe):
         raise StackError("Invalid served model name")
     if s["host"] not in ("0.0.0.0", "127.0.0.1"):
         raise StackError("serve.host must be 0.0.0.0 or 127.0.0.1")
+    for key, low, high in (("temperature", 0, 100), ("top_p", 0, 1)):
+        if key in s:
+            value = s[key]
+            if (type(value) not in (int, float) or not math.isfinite(value)
+                    or not low <= value <= high or (key == "top_p" and value == 0)):
+                raise StackError(f"serve.{key} must be a finite number in {'(' if key == 'top_p' else '['}{low}, {high}]")
+    if "top_k" in s and (type(s["top_k"]) is not int or not 0 <= s["top_k"] <= 4294967295):
+        raise StackError("serve.top_k must be an integer in [0, 4294967295]")
     owned = {"TF_DSV41_CONTEXT", "TF_DSV41_SLOTS", "TF_DSV41_DRAIN_S"}
     for key, val in recipe["env"].items():
         if key in owned or not re.fullmatch(r"(?:TF_DSV41_|GLM53_TF_)[A-Z0-9_]+", key):
@@ -214,6 +223,9 @@ def plan(root, recipe, cluster):
             args += ["tensorfold-dsv41", "serve", model, "--host", s["host"], "--port", str(s["port"]),
                      "--parallel", str(s["slots"]), "--context", str(s["context"]),
                      "--name", s["name"], "--max-tokens", str(s["max_tokens"])]
+            for key in ("temperature", "top_p", "top_k"):
+                if key in s:
+                    args += ["--" + key.replace("_", "-"), str(s[key])]
             if env.get("TF_DSV41_THINKING") == "0": args.append("--no-thinking")
             if env.get("TF_DSV41_DRAFTS", "0") == "0": args.append("--no-drafts")
         else:
