@@ -62,7 +62,7 @@ def child(root, name):
     return Path(root) / path
 
 
-def verify_model(snapshot):
+def verify_model(snapshot, *, verify_weights=True):
     snapshot = Path(snapshot)
     for name in ("config.json", "tokenizer.json"):
         json.loads((snapshot / name).read_text())
@@ -80,17 +80,21 @@ def verify_model(snapshot):
         if not line.strip(): continue
         wanted, name = line.split(maxsplit=1)
         name = name.lstrip("*")
-        if file_hash(child(snapshot, name)) != wanted:
+        path = child(snapshot, name)
+        if not path.is_file():
+            raise RuntimeError(f"Missing model shard: {name}")
+        if verify_weights and file_hash(path) != wanted:
             raise RuntimeError(f"SHA256 mismatch: {name}")
         checked.append(name)
-        print(f"verified {name}", file=sys.stderr, flush=True)
+        if verify_weights:
+            print(f"verified {name}", file=sys.stderr, flush=True)
     if not checked:
         raise RuntimeError("Empty SHA256SUMS")
     return checked
 
 
-def verify_hub_model(snapshot, info, revision):
-    """Verify a manifest-less pack against immutable Hub metadata, on the head only."""
+def verify_hub_model(snapshot, info, revision, *, verify_weights=True):
+    """Check pinned metadata; read tensor payloads only when explicitly requested."""
     if info.sha != revision:
         raise RuntimeError("Repository did not resolve to its pinned commit")
     snapshot = Path(snapshot)
@@ -108,7 +112,8 @@ def verify_hub_model(snapshot, info, revision):
                 raise RuntimeError(f"Missing LFS SHA256 for shard: {name}")
         if lfs is not None:
             wanted = lfs.sha256
-            if not wanted or not re.fullmatch(r"[0-9a-f]{64}", wanted) or file_hash(path) != wanted:
+            if (not wanted or not re.fullmatch(r"[0-9a-f]{64}", wanted)
+                    or (verify_weights and file_hash(path) != wanted)):
                 raise RuntimeError(f"Hub SHA256 mismatch or missing hash: {name}")
             hashes[name] = wanted
         else:
@@ -118,7 +123,8 @@ def verify_hub_model(snapshot, info, revision):
             if blob != item.blob_id:
                 raise RuntimeError(f"Hub Git blob mismatch: {name}")
             hashes[name] = hashlib.sha256(data).hexdigest()
-        print(f"verified {name}", file=sys.stderr, flush=True)
+        if verify_weights:
+            print(f"verified {name}", file=sys.stderr, flush=True)
     required = {"config.json", "tokenizer.json", "model.safetensors.index.json"}
     if not required <= hashes.keys() or not shards:
         raise RuntimeError("Hub metadata lacks model configuration, tokenizer, index or shards")
@@ -139,6 +145,7 @@ def engram_files(index):
 
 
 def download(spec):
+    verify_weights = spec.get("verify_weights", False)
     client, token = authenticated_client()
     from huggingface_hub import hf_hub_download, snapshot_download, try_to_load_from_cache
     common = {"cache_dir": spec["cache"], "max_workers": 4, "token": token}
@@ -162,12 +169,19 @@ def download(spec):
     model_path = snapshot_download(repo_id=model["repo"], revision=model["revision"], **common)
     original = snapshot_download(repo_id=engram["repo"], revision=engram["revision"],
                                  allow_patterns=["config.json", "model.safetensors.index.json", *files], **common)
+    for info, folder, allow in zip(infos, (model_path, original),
+                                  (None, set(files) | {"config.json", "model.safetensors.index.json"})):
+        for item in info.siblings:
+            if allow is not None and item.rfilename not in allow: continue
+            path = child(folder, item.rfilename)
+            if not path.is_file() or path.stat().st_size != item.size:
+                raise RuntimeError(f"Missing file or size mismatch: {item.rfilename}")
     mode = model.get("verification", "sha256sums")
     if mode == "hub-sha256":
-        model_hashes = verify_hub_model(model_path, infos[0], model["revision"])
+        model_hashes = verify_hub_model(model_path, infos[0], model["revision"], verify_weights=verify_weights)
         checked = model_hashes
     elif mode == "sha256sums":
-        checked = verify_model(model_path)
+        checked = verify_model(model_path, verify_weights=verify_weights)
         model_hashes = None
     else:
         raise RuntimeError(f"Unknown model verification mode: {mode}")
@@ -178,10 +192,12 @@ def download(spec):
     for name in files:
         lfs = metadata[name].lfs
         wanted = lfs.sha256 if lfs is not None else None
-        if not wanted or file_hash(child(original, name)) != wanted:
+        if not wanted or (verify_weights and file_hash(child(original, name)) != wanted):
             raise RuntimeError(f"Engram SHA256 mismatch or missing LFS hash: {name}")
-        print(f"verified original Engram shard {name}", file=sys.stderr, flush=True)
-    receipt = {"model": model, "engram": engram, "model_files_verified": len(checked), "engram_files": files,
+        if verify_weights:
+            print(f"verified original Engram shard {name}", file=sys.stderr, flush=True)
+    receipt = {"model": model, "engram": engram, "weights_verified": verify_weights,
+               "model_files_verified": len(checked) if verify_weights else 0, "engram_files": files,
                "engram_sha256": {name: metadata[name].lfs.sha256 for name in files}}
     if model_hashes is not None:
         receipt["model_sha256"] = model_hashes

@@ -9,7 +9,7 @@ from .hub import child, file_hash
 from .node import snapshot
 
 
-def manifest(cache, recipe, receipt):
+def manifest(cache, recipe, receipt, *, verify_weights=False):
     root = Path(cache).resolve()
     entries = {}
 
@@ -29,7 +29,7 @@ def manifest(cache, recipe, receipt):
             add(Path(os.path.normpath(path.parent / target)), known_hash)
         elif path.is_file():
             entries[relative] = {"path": relative, "size": path.stat().st_size,
-                                 "sha256": known_hash or file_hash(path)}
+                                 "sha256": known_hash or (file_hash(path) if verify_weights else None)}
         else:
             raise RuntimeError(f"Missing cache file: {relative}")
 
@@ -40,7 +40,7 @@ def manifest(cache, recipe, receipt):
                 hashes = receipt.get("model_sha256", {})
                 if (receipt.get("model") != recipe[key] or not hashes
                         or any(not re.fullmatch(r"[0-9a-f]{64}", h) for h in hashes.values())):
-                    raise RuntimeError("Missing or mismatched verified Hub model receipt")
+                    raise RuntimeError("Missing or mismatched Hub model checksum receipt")
                 files = list(hashes)
             else:
                 hashes = {}
@@ -99,12 +99,13 @@ def prepare(cache, entries):
     return {"required_bytes": required, "replacement_headroom_bytes": largest}
 
 
-def verify(cache, entries):
+def verify(cache, entries, *, verify_weights=True):
     for path, entry in paths(cache, entries):
         if "link" in entry:
             if not path.is_symlink() or os.readlink(path) != entry["link"] or not path.is_file():
                 raise RuntimeError(f"Cache link mismatch: {entry['path']}")
-        elif (not path.is_file() or path.stat().st_size != entry["size"]
-              or file_hash(path) != entry["sha256"]):
-            raise RuntimeError(f"Cache SHA256 mismatch: {entry['path']}")
-    return {"cache_entries_verified": len(entries)}
+        elif not path.is_file() or path.stat().st_size != entry["size"]:
+            raise RuntimeError(f"Cache file missing or size mismatch: {entry['path']}")
+        elif verify_weights and (not entry.get("sha256") or file_hash(path) != entry["sha256"]):
+            raise RuntimeError(f"Cache SHA256 mismatch or missing hash: {entry['path']}")
+    return {"cache_entries_checked": len(entries), "weights_verified": verify_weights}

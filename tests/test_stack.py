@@ -372,6 +372,8 @@ class FilesTests(unittest.TestCase):
             self.assertEqual(hub.verify_model(root), ["weight.safetensors"])
             (root / "weight.safetensors").write_bytes(b"wrong")
             with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"): hub.verify_model(root)
+            with patch.object(hub, "file_hash", side_effect=AssertionError("default read tensor payload")):
+                self.assertEqual(hub.verify_model(root, verify_weights=False), ["weight.safetensors"])
 
     def test_owned_worker_directory_is_required(self):
         with tempfile.TemporaryDirectory() as tmp:

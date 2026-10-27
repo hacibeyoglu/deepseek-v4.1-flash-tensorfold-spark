@@ -1,5 +1,7 @@
 """Pinned Hub verification and recipe isolation, without network or model downloads."""
 import copy
+import contextlib
+import io
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +13,7 @@ from unittest.mock import Mock, patch
 
 from lib import cache_sync, hub, node
 from lib.config import StackError, load_recipe, model_dir, plan, synthetic_cluster, validate_recipe
+from scripts import stack
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -87,7 +90,7 @@ class HubChecksumTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'unverified shards'):
             self.verify()
 
-    def test_download_returns_verified_hashes_and_keeps_explicit_token(self):
+    def test_download_records_expected_hashes_without_scanning_weights(self):
         original = {'repo': 'org/engram', 'revision': 'b' * 40}
         folder = node.snapshot(self.cache, original)
         folder.mkdir(parents=True)
@@ -103,8 +106,11 @@ class HubChecksumTests(unittest.TestCase):
                       try_to_load_from_cache=Mock(return_value=None))
         with patch.dict(sys.modules, {'huggingface_hub': module}), \
                 patch('lib.hub.authenticated_client', return_value=(client, 'fixture-token')), \
-                patch('lib.hub.shutil.disk_usage', return_value=Item(free=1 << 40)):
+                patch('lib.hub.shutil.disk_usage', return_value=Item(free=1 << 40)), \
+                patch('lib.hub.file_hash', side_effect=AssertionError('default download hashed weights')):
             receipt = hub.download({'cache': str(self.cache), 'model': self.model, 'engram': original})
+        self.assertFalse(receipt['weights_verified'])
+        self.assertEqual(receipt['model_files_verified'], 0)
         self.assertEqual(receipt['model_sha256'], self.verify())
         self.assertEqual(receipt['engram_sha256'], {'embedding.bin': sha})
         for call in module.snapshot_download.call_args_list:
@@ -123,7 +129,7 @@ class HubChecksumTests(unittest.TestCase):
         receipt = {**recipe, 'model_sha256': self.verify(), 'engram_files': ['embedding.bin'],
                    'engram_sha256': {'embedding.bin': hub.file_hash(folder / 'embedding.bin')}}
         (self.folder / 'unverified').write_text('do not copy')
-        entries = cache_sync.manifest(self.cache, recipe, receipt)
+        entries = cache_sync.manifest(self.cache, recipe, receipt, verify_weights=True)
         self.assertFalse(any(e['path'].endswith('unverified') for e in entries))
         worker = Path(self.temp.name) / 'worker'
         cache_sync.prepare(worker, entries)
@@ -140,6 +146,20 @@ class HubChecksumTests(unittest.TestCase):
 
 
 class RecipeCompatibilityTests(unittest.TestCase):
+    def test_setup_and_download_require_explicit_verification_flag(self):
+        for action in (['run', 'flash17-exl3-2.8bpw', '--setup'], ['download']):
+            for verify in (False, True):
+                with patch('scripts.stack.Cluster') as cluster, \
+                        patch('scripts.stack.read_json', return_value={}), \
+                        patch('scripts.stack.locked', return_value=contextlib.nullcontext()), \
+                        patch('scripts.stack.sources.fetch'), contextlib.redirect_stdout(io.StringIO()):
+                    cluster.return_value.start.return_value = None
+                    cluster.return_value.download.return_value = None
+                    stack.main(action + (['--verify-weights'] if verify else []))
+                    cluster.return_value.download.assert_called_once_with(verify_weights=verify)
+        with self.assertRaisesRegex(StackError, 'requires'):
+            stack.main(['run', '--verify-weights'])
+
     def test_new_recipes_keep_precision_and_get_separate_assets(self):
         base = load_recipe(ROOT, 'flash17-exl3-2.8bpw')
         cluster = synthetic_cluster(ROOT, '192.0.2.11,192.0.2.12')

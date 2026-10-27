@@ -45,7 +45,7 @@ class CacheTransferTests(unittest.TestCase):
         (self.head / 'token').write_text('must-not-copy')
         (self.head / 'models--other').mkdir()
         (self.head / 'models--other/file').write_text('unrelated')
-        self.entries = cache_sync.manifest(self.head, self.recipe, self.receipt)
+        self.entries = cache_sync.manifest(self.head, self.recipe, self.receipt, verify_weights=True)
 
     def copy(self):
         listing = ''.join(e['path'] + '\0' for e in self.entries).encode()
@@ -78,6 +78,21 @@ class CacheTransferTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cache_sync.prepare(self.worker, [{'path': '../escape', 'size': 1}])
 
+    def test_default_copy_checks_sizes_without_hashing_tensors(self):
+        with patch('lib.cache_sync.file_hash', side_effect=AssertionError('default hashed tensors')):
+            entries = cache_sync.manifest(self.head, self.recipe, self.receipt)
+            cache_sync.prepare(self.worker, entries)
+            self.copy()
+            result = node.main({'action': 'cache-verify', 'root': str(self.worker),
+                                'cache': str(self.worker), 'entries': entries, 'receipt': self.receipt})
+            self.assertFalse(result['weights_verified'])
+            weight = node.snapshot(self.worker, self.recipe['model']) / 'weights.bin'
+            weight.write_bytes(b'wrong')  # Same-size corruption needs an explicit hash scan.
+            cache_sync.verify(self.worker, entries, verify_weights=False)
+            weight.write_bytes(b'truncated')
+            with self.assertRaisesRegex(RuntimeError, 'size mismatch'):
+                cache_sync.verify(self.worker, entries, verify_weights=False)
+
     def test_insufficient_space_fails_before_copy(self):
         with patch('lib.cache_sync.shutil.disk_usage', return_value=Mock(free=0)):
             with self.assertRaisesRegex(RuntimeError, 'lacks space'):
@@ -86,7 +101,7 @@ class CacheTransferTests(unittest.TestCase):
     def test_offline_receipt_only_written_after_verification(self):
         self.worker.mkdir()
         request = {'action': 'cache-verify', 'root': str(self.worker), 'cache': str(self.worker),
-                   'entries': self.entries, 'receipt': self.receipt}
+                   'entries': self.entries, 'receipt': self.receipt, 'verify_weights': True}
         with self.assertRaises(RuntimeError):
             node.main(request)
         self.assertFalse((self.worker / '.stack/download.json').exists())
@@ -132,7 +147,10 @@ class OrchestrationTransferTests(unittest.TestCase):
             self.c.download()
             command = run.call_args.args[0]
             self.assertTrue(command[-1].startswith(self.target + ':'))
-            self.assertIn('--checksum', command)
+            self.assertNotIn('--checksum', command)
+            self.assertIn('--size-only', command)
+            self.assertFalse(self.c.remotes[0].call.call_args.kwargs['verify_weights'])
+            self.assertFalse(self.c.remotes[1].call.call_args.kwargs['verify_weights'])
             self.assertNotIn('--delete', command)
             self.assertEqual([c.args[0] for c in self.c.remotes[1].call.call_args_list], ['cache-prepare', 'cache-verify'])
             self.assertEqual(self.c.remotes[0].call.call_args.args[0], 'download')
@@ -147,6 +165,32 @@ class OrchestrationTransferTests(unittest.TestCase):
         with self.assertRaises(StackError):
             self.c.download()
         self.c.remotes[0].call.assert_not_called()
+
+    def test_explicit_download_hashes_both_nodes_and_enables_rsync_checksums(self):
+        self.c.transfer_target = Mock(return_value=self.target)
+        self.c.sync_code = Mock()
+        with patch('lib.cluster.cache_sync.manifest', return_value=[]), patch('lib.cluster.sources.run') as run:
+            self.c.download(verify_weights=True)
+            self.assertIn('--checksum', run.call_args.args[0])
+            self.assertNotIn('--size-only', run.call_args.args[0])
+            self.assertTrue(self.c.remotes[0].call.call_args.kwargs['verify_weights'])
+            self.assertTrue(self.c.remotes[1].call.call_args.kwargs['verify_weights'])
+
+    def test_standalone_verification_uses_both_caches_without_download_or_transfer(self):
+        self.c.pair = Mock(return_value=[{'weights_verified': True}] * 2)
+        receipt = {key: self.c.recipe[key] for key in ('model', 'engram')}
+        entries = [{'path': 'weights', 'sha256': 'a' * 64}]
+        with patch('lib.cluster.read_json', return_value=receipt), \
+                patch('lib.cluster.cache_sync.manifest', return_value=entries), \
+                patch('lib.cluster.sources.run', side_effect=AssertionError('unexpected transfer')):
+            self.c.verify_weights()
+            self.c.pair.assert_called_once_with('verify-weights', [
+                {'cache': n['hub_cache'], 'entries': entries} for n in self.c.nodes])
+            self.c.remotes[0].call.assert_not_called()
+            self.c.remotes[1].call.assert_not_called()
+            receipt['model'] = {}
+            with self.assertRaisesRegex(StackError, 'another checkpoint'):
+                self.c.verify_weights()
 
     def test_image_skips_identical_and_streams_missing_over_fabric(self):
         self.c.remotes[0].call.return_value = {'id': 'sha256:expected'}

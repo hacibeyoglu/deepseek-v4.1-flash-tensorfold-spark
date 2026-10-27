@@ -6,7 +6,7 @@ Runtime `2c3def4c7fdda912`, tested locally on x86_64 with Zig 0.17.0:
 
 | Check | Result |
 |---|---|
-| Utilities | 69 tests passed; shell checks and isolated dry-runs passed for all three recipes |
+| Utilities | 73 tests passed; shell checks and isolated dry-runs passed for all three recipes |
 | Runtime host suite | Fresh cache: 103/103 build steps; 669 passed, 13 skipped, zero failures |
 | Host executable build | 30/30 steps; no CUDA fatbins or GPU execution |
 | Real checkpoint headers | All 43 layers planned on both TP=2 ranks for each pack; 47/47 loader tests passed per pack |
@@ -15,6 +15,9 @@ Runtime `2c3def4c7fdda912`, tested locally on x86_64 with Zig 0.17.0:
 
 Tests cover FP16 widening without BF16 rounding, unchanged FP32/BF16 outputs, invalid dtype/shape rejection,
 pack-derived AOT widths, pinned Hub hashes, corruption, explicit tokens, and offline worker verification.
+Setup/download now skip tensor hashing and use size-based cache reuse; tests prohibit default payload hash reads,
+check explicit verification on both nodes, and retain missing/truncated-file checks. `verify-weights` checks
+existing caches without downloads; `download --verify-weights` also enables rsync checksum repair.
 Header checks used all 39 EAQ v1 and 43 LibertAI shard headers and their pinned indexes, without weight payloads.
 The local suite requires loopback sockets for synthetic transport tests. No Sparks were accessed.
 

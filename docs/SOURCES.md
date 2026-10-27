@@ -34,9 +34,10 @@ and [0rand's Python stack](https://github.com/0rand/DeepSeek-V4.1-Flash-1017-EXL
 Their engines and display-KV changes are not transplanted. All 39 EAQ and 43 LibertAI shard headers were inspected;
 each pack has 192,495 tensors. EAQ v1.1's mixed BF16 linears require separate runtime work.
 
-`model.verification` defaults to `sha256sums`. The new recipes explicitly select `hub-sha256`: the head checks
-the pinned revision, file sizes, LFS SHA256 hashes, small Git-file blob hashes, and index coverage. Verified
-SHA256 receipts accompany fabric transfers for offline worker verification. Cached checkpoint files stay unchanged.
+`model.verification` selects the checksum source, defaulting to `sha256sums`; the new recipes select `hub-sha256`.
+Downloads check pinned revisions, file sizes, small Git-file blob hashes, and index coverage, and record expected
+tensor hashes. Tensor checksum scans require `verify-weights` or `--verify-weights`. Worker checks stay offline;
+cached checkpoint files stay unchanged.
 
 ## Build and assets
 
@@ -56,7 +57,8 @@ Transfer behavior reviewed on 2026-10-26 against upstream
 [`autodiscover.sh`](https://github.com/eugr/spark-vllm-docker/blob/main/autodiscover.sh): head downloads followed
 by cache rsync, and Docker save/load with matching-image skips. This stack uses the same approach over a
 verified direct fabric SSH destination. It limits cache copying to pinned snapshots and their required blobs,
-verifies the worker offline, and also distributes the asset-preparation image from the head.
+checks worker files offline, and also distributes the asset-preparation image from the head. Tensor hashes and
+rsync checksum scans are now opt-in; default transfers reuse immutable cached blobs by size.
 
 For updates, review the source diff, change the lock/patches, assemble sources, run the
 [checks](VALIDATION.md), then build and prepare under the new runtime ID. Do not reuse stale asset receipts.

@@ -22,7 +22,7 @@ def parser():
     ap = argparse.ArgumentParser(description=__doc__)
     commands = ap.add_subparsers(dest="action", required=True)
     for name in ("setup", "fetch", "download", "build", "prepare", "start", "stop", "restart",
-                 "status", "logs", "doctor", "verify", "rollback", "plan", "run", "test-runtime", "test-assets"):
+                 "status", "logs", "doctor", "verify", "verify-weights", "rollback", "plan", "run", "test-runtime", "test-assets"):
         sub = commands.add_parser(name)
         sub.add_argument("--recipe", default="flash17-exl3-2.8bpw", help="Recipe name or JSON path")
         sub.add_argument("--config", type=Path, default=ROOT / "cluster.json")
@@ -46,6 +46,8 @@ def parser():
             for flag in ("setup", "download-only", "build-only", "prepare-only"):
                 group.add_argument("--" + flag, action="store_true")
             sub.add_argument("--list", action="store_true")
+        if name in ("run", "download"):
+            sub.add_argument("--verify-weights", action="store_true", help="Explicitly hash checkpoint tensors on both nodes")
         if name == "test-runtime":
             sub.add_argument("--builder-image", help="Default: this runtime's builder image")
     return ap
@@ -82,6 +84,8 @@ def runtime_tests(image):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.action == "run" and args.verify_weights and not (args.setup or args.download_only):
+        raise StackError("--verify-weights requires --setup or --download-only; use ./stack verify-weights for cached files")
     if args.action == "run" and args.list:
         print("\n".join(p.stem for p in sorted((ROOT / "recipes").glob("*.json"))))
         return 0
@@ -100,6 +104,7 @@ def main(argv=None):
         cluster = synthetic_cluster(ROOT, args.nodes) if args.nodes else read_json(args.config)
         generated = plan(ROOT, recipe, cluster)
         generated["action"] = args.action
+        generated["verify_weights"] = args.action == "verify-weights" or getattr(args, "verify_weights", False)
         generated["steps"] = (["fetch", "download", "build", "prepare", "start", "verify"]
                               if getattr(args, "setup", False) else [args.action])
         print(json.dumps(generated, indent=2))
@@ -143,16 +148,18 @@ def main(argv=None):
         if args.action == "run":
             if args.setup:
                 sources.fetch(ROOT)
-                cluster.download()
+                cluster.download(verify_weights=args.verify_weights)
                 cluster.build()
                 cluster.prepare()
                 result = cluster.start()
-            elif args.download_only: result = cluster.download()
+            elif args.download_only: result = cluster.download(verify_weights=args.verify_weights)
             elif args.build_only:
                 sources.fetch(ROOT)
                 result = cluster.build()
             elif args.prepare_only: result = cluster.prepare()
             else: result = cluster.start()
+        elif args.action == "download":
+            result = cluster.download(verify_weights=args.verify_weights)
         elif args.action == "rollback":
             previous = read_json(ROOT / ".stack/rollback.json")
             restored = Cluster(ROOT, previous["recipe"], previous["cluster"])
@@ -163,7 +170,7 @@ def main(argv=None):
             cluster.stop()
             result = restored.start()
         else:
-            result = getattr(cluster, args.action)()
+            result = getattr(cluster, args.action.replace("-", "_"))()
         if result is not None: print(json.dumps(result, indent=2))
     return 0
 

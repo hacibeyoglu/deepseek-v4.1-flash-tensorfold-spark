@@ -156,27 +156,35 @@ class Cluster:
                      "--exclude=__pycache__", "-e", shlex.join(SSH),
                      str(self.root / relative) + "/", peer["target"] + ":" + dest + "/"])
 
-    def download(self):
+    def download(self, verify_weights=False):
         target = self.transfer_target()
         self.sync_code()
         head = self.remotes[0].call("download", node=self.nodes[0], recipe=self.recipe,
-                                    hf_version=self.lock["huggingface_hub"])
-        entries = cache_sync.manifest(self.nodes[0]["hub_cache"], self.recipe, head)
+                                    hf_version=self.lock["huggingface_hub"], verify_weights=verify_weights)
+        entries = cache_sync.manifest(self.nodes[0]["hub_cache"], self.recipe, head, verify_weights=verify_weights)
         peer = self.nodes[1]
         self.remotes[1].call("cache-prepare", cache=peer["hub_cache"], entries=entries)
-        print("Syncing weights to worker; checksum scans may take time before transfer progress advances.", flush=True)
+        print("Syncing weights to worker" + (" with checksum scans..." if verify_weights else " (size checks only)..."), flush=True)
         # Explicit NUL-delimited paths preserve snapshot links and copy only their required blobs.
         # No HF_HOME, credentials, other revisions, deletion, or in-place blob writes.
         with tempfile.TemporaryFile() as listing:
             listing.write(b"".join(e["path"].encode() + b"\0" for e in entries))
             listing.seek(0)
-            sources.run([*RSYNC, "--checksum", "--partial-dir=.rsync-partial",
+            sources.run([*RSYNC, "--checksum" if verify_weights else "--size-only", "--partial-dir=.rsync-partial",
                          "--no-whole-file", "--from0", "--files-from=-", "-e", shlex.join(SSH),
                          self.nodes[0]["hub_cache"] + "/", target + ":" + peer["hub_cache"] + "/"],
                         stdin=listing)
-        print("Verifying copied weights on worker (SHA256)...", flush=True)
-        worker = self.remotes[1].call("cache-verify", cache=peer["hub_cache"], entries=entries, receipt=head)
+        print("Checking worker " + ("SHA256 hashes..." if verify_weights else "files and sizes..."), flush=True)
+        worker = self.remotes[1].call("cache-verify", cache=peer["hub_cache"], entries=entries, receipt=head,
+                                     verify_weights=verify_weights)
         return [head, worker]
+
+    def verify_weights(self):
+        receipt = read_json(self.root / ".stack/download.json")
+        if any(receipt.get(key) != self.recipe[key] for key in ("model", "engram")):
+            raise StackError("Download receipt belongs to another checkpoint; select its recipe")
+        entries = cache_sync.manifest(self.nodes[0]["hub_cache"], self.recipe, receipt, verify_weights=True)
+        return self.pair("verify-weights", [{"cache": n["hub_cache"], "entries": entries} for n in self.nodes])
 
     def transfer_target(self):
         """Fail closed rather than moving large artifacts over an unverified management route."""

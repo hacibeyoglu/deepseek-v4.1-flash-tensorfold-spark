@@ -47,7 +47,8 @@ for example, `./scripts/start.sh` is equivalent to `./stack start`.
 |---|---|
 | `./stack setup --worker HOST` / `./stack doctor` | Discover configuration / recheck nodes, network, and containers |
 | `./stack fetch` | Export pinned sources and apply patches |
-| `./stack download` | Download and hash-check weights/Engram shards on the head; sync and verify the worker offline |
+| `./stack download` | Download weights/Engram shards on the head; sync and check worker files and sizes |
+| `./stack verify-weights` | Explicitly check cached checkpoint SHA256 hashes on both nodes, without Hub access or downloads |
 | `./stack build` | Build images and verify the same runtime image on both nodes; requires fetched sources |
 | `./stack prepare` | Pull the preparation image on the head and copy it; pack Engram, generate assets, and check AOT coverage |
 | `./stack start` / `./stack stop` | Start worker then head and verify generation / drain and stop both ranks |
@@ -68,12 +69,21 @@ Containers mount the entire Hub cache read-only so snapshot symlinks work. Cache
 `./stack download` downloads the pinned model and original Engram shards on the head only. It then uses rsync
 over SSH to the worker's first matched fabric address, preserving snapshot links and their required blobs
 (including hub-level shared blobs). Only the selected snapshots and referenced blobs are copied; other caches
-and revisions are retained. Transfers use checksums, partial-file reuse, and atomic replacement. The worker
-verifies SHA256 hashes offline before writing its download receipt. Repeating the command reuses cached data;
-checksum scans still read the selected files on disk.
+and revisions are retained. Transfers use size-based cache reuse, partial-file reuse, and atomic replacement.
+The worker checks file presence, sizes, and snapshot links before writing its download receipt.
+**Setup and downloads do not scan tensor checksums by default.** Same-size corruption requires explicit verification:
+
+```bash
+./stack verify-weights --recipe flash17-exl3-2.8bpw    # Check existing caches on both nodes
+./stack download --verify-weights                   # Download/sync with checksum scans
+# Also supported: ./stack run RECIPE --setup --verify-weights
+```
+
+Select the same recipe used for downloading. `verify-weights` reports corruption without changing files;
+`download --verify-weights` also uses rsync checksums to repair worker files from a valid head cache.
 All rsync stages show filenames, aggregate transfer progress (bytes, percentage, speed, and time estimates),
-and final statistics, with line-buffered output. Checksum scanning and subsequent SHA256 verification are
-separate from transfer progress and can take time even when the cache is already populated.
+and final statistics, with line-buffered output. Explicit checksum verification reads the full selected weights
+and can take time even when the cache is already populated. API readiness and generation checks remain automatic.
 
 `./stack build` builds the runtime image on the head and streams `docker save` into worker `docker load`.
 `./stack prepare` pulls the pinned preparation image on the head and distributes it the same way. Matching

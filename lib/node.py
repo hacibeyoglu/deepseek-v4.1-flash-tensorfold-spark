@@ -146,7 +146,8 @@ def download(request):
     check = run([str(python), "-c", "import huggingface_hub; print(huggingface_hub.__version__)"], capture=True, check=False)
     if check.returncode or check.stdout.strip() != version:
         run([str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", f"huggingface_hub=={version}"])
-    spec = {"cache": node["hub_cache"], "model": recipe["model"], "engram": recipe["engram"]}
+    spec = {"cache": node["hub_cache"], "model": recipe["model"], "engram": recipe["engram"],
+            "verify_weights": request.get("verify_weights", False)}
     proc = processes.run([str(python), str(Path(node["root"]) / "lib/hub.py")],
                             env={**os.environ, "HF_HOME": node["hf_home"], "HF_HUB_CACHE": node["hub_cache"]},
                             input=json.dumps(spec), stdout=subprocess.PIPE, text=True)
@@ -272,6 +273,9 @@ def main(request):
     if action == "state": return inspect(request["name"], request["stack"], request.get("expected_env"), request.get("expected_command"))
     if action == "image": return image_id(request["image"], request.get("missing_ok", False))
     if action == "download": return download(request)
+    if action == "verify-weights":
+        from lib import cache_sync
+        return cache_sync.verify(request["cache"], request["entries"])
     if action in ("cache-prepare", "cache-verify"):
         from lib import cache_sync
         if action == "cache-prepare":
@@ -279,7 +283,8 @@ def main(request):
             # An interrupted copy must not leave an older receipt authorizing startup.
             (Path(root) / ".stack/download.json").unlink(missing_ok=True)
             return result
-        verified = cache_sync.verify(request["cache"], request["entries"])
+        verified = cache_sync.verify(request["cache"], request["entries"],
+                                     verify_weights=request.get("verify_weights", False))
         from lib.config import atomic_json
         receipt = {**request["receipt"], **verified, "source": "head-fabric-sync"}
         atomic_json(Path(root) / ".stack/download.json", receipt)
