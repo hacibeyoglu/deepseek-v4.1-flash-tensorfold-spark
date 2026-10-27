@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import pwd
+import re
 import shutil
 import socket
 import subprocess
@@ -255,6 +256,46 @@ def prepare(request):
             "engram": "header, size and sampled rows passed", "shared": shared}
 
 
+def reuse_prepared(node, revision):
+    """Adopt completed legacy cache files without reading/copying weight payloads.
+
+    Native files are immutable after atomic rename. Hard links leave legacy mounts
+    intact; native format/source/pack/TP keys still decide which files can be read.
+    Incomplete .tmp files and existing destinations are never adopted/overwritten.
+    """
+    base = Path(node["root"]) / ".stack/prepared"
+    target = Path(node["paths"]["prepared"])
+    if target != base / revision:
+        return 0  # Older launch plans retain their original paths.
+    target.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for runtime in sorted(base.iterdir()):
+        if not re.fullmatch(r"[0-9a-f]{16}", runtime.name) or runtime.is_symlink() or not runtime.is_dir():
+            continue
+        old = runtime / revision
+        if old.is_symlink() or not old.is_dir():
+            continue
+        for key in sorted(old.iterdir()):
+            if not re.fullmatch(r"[0-9a-f]{16}", key.name) or key.is_symlink() or not key.is_dir():
+                continue
+            rank = key / f"rank{node['rank']}"
+            if rank.is_symlink() or not rank.is_dir():
+                continue
+            for source in sorted(rank.iterdir()):
+                if not re.fullmatch(r"(?:L[0-9]+|top)\.bin", source.name) or source.is_symlink() or not source.is_file():
+                    continue
+                dest = target / key.name / rank.name / source.name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(source, dest, follow_symlinks=False)
+                except FileExistsError:
+                    continue
+                linked += 1
+    if linked:
+        print(f"rank {node['rank']}: reused {linked} prepared weight files from earlier runtime namespaces", file=sys.stderr)
+    return linked
+
+
 def check_ready_files(request):
     node = request["node"]
     assets = Path(node["paths"]["assets"])
@@ -288,6 +329,7 @@ def check_ready_files(request):
     result = image_id(request["image"])
     if result["labels"].get("io.spark-tensorfold.runtime") != request["runtime"]:
         raise RuntimeError("Runtime image label does not match this source and patch set")
+    reuse_prepared(node, request["recipe"]["model"]["revision"])
     prepared = Path(node["paths"]["prepared"])
     if not any(prepared.iterdir()) and shutil.disk_usage(prepared).free < 110 * (1 << 30):
         raise RuntimeError("First model load needs approximately 95 GiB of prepared weights; leave 110 GiB free")
@@ -297,6 +339,9 @@ def check_ready_files(request):
 def free_ports(ports):
     for port in ports:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            # Match the server's restart semantics: TIME_WAIT connections from
+            # the stopped API are harmless. A live listener still prevents bind.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try: sock.bind(("0.0.0.0", port))
             except OSError as exc: raise RuntimeError(f"Port {port} is occupied: {exc}") from exc
 

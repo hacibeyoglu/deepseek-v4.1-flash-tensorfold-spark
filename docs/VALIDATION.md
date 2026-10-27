@@ -1,4 +1,53 @@
-# Validation (2026-10-26)
+# Validation (2026-10-27)
+
+## Prepared-weight reuse and startup (2026-10-27)
+
+The active baseline is `jayleaton/DeepSeek-V4.1-Flash-1017-EXL3-2.8bpw` at
+`859396591c340195526aaf61f94b4ad5323a5e18`, native Zig TP2 runtime `efbc1a1b9c78642d`, image
+`sha256:f1cc36f6556d26e8f381bc53731924198715d1ef97427d896c4b9e892b8078ce` on both nodes.
+Four slots, 1,048,576 context, the split 2,100,224-token shared pool, model/KV precision, DSpark,
+native vision settings and memory guards were retained. No runtime/image rebuild or asset regeneration
+was needed for this orchestration change.
+
+| Stage | First conversion start | Cached start |
+|---|---:|---:|
+| Head runtime load to API serving | 362.6 s | 120.0 s |
+| Head weight load | 337.6 s | 109.4 s |
+| Head prepared files read / built / written | 0 / 44 / 44 | 44 / 0 / 0 |
+| Worker cached weight load | — | 109.2 s |
+
+These are **different cache states**, not an A/B speedup from changing an inference setting. The first
+boot created native weight images; the later boot reused them. On the cached boot each rank spent about
+98 seconds reading 95.1 GiB of images; remaining startup work included uploads and serving initialization.
+The measured whole `stack start` command took 130.1 seconds, including preflight, polling and generation.
+Disk/page-cache state was not forced or flushed, and these are single observations rather than repeated
+benchmarks. No other inference workload was active.
+
+The launcher now retains `.stack/prepared/<model-revision>/` across runtime updates. Native format,
+builder-source, shard metadata, TP and DSpark keys still determine compatibility. Preflight adopted all
+44 completed files per rank from the old runtime-specific namespace by hard link, with no payload copy
+or checksum scan. Old files/paths remain available; incomplete `.tmp` files are ignored. This avoids
+unnecessary conversion after unrelated runtime changes, but cannot avoid conversion when the native
+weight-image key changes. Matching AOT assets are still required after a runtime update.
+
+A controlled restart also exposed a pre-existing false occupied-port error from the stopped API's
+`TIME_WAIT` sockets. The preflight bind probe now sets `SO_REUSEADDR`, accepting these closed connections
+while still rejecting live listeners on Linux. No unrelated process was stopped.
+
+- `./scripts/test.sh`: 97 tests, shell syntax checks and isolated two-node command generation passed.
+  New regressions cover real filesystem cache adoption, no payload reads/copies, existing-file preservation,
+  rank/revision separation, ignored partial files/symlinks, and real TCP listener/closed-connection states.
+  The suite needed loopback permission on the client; the TCP test also passed on spark01 ARM64.
+- Both ranks use the intended image and stable prepared mounts, with matching effective commands/env,
+  zero restarts and no OOM. API model identity and health passed; the arithmetic canary returned `391`
+  with 18 prompt tokens, two completion tokens and no cached prompt tokens.
+- The boot guard reported worst serving headroom of 4.89 / 6.41 GiB. Its existing prefill guard retained
+  the 4K-to-2K fallback; context/concurrency capacity and generation performance were not requalified.
+
+Evidence and original launcher backups are in `.stack/recovery/startup-cache-20261027/` on each node:
+`cold-r0.log` / `cold-r1.log`, `warm-r0.log` / `warm-r1.log`; the head additionally has `cold-launch.json`,
+`restart.log` (the port-check failure), `warm-start.log` and `warm-timing.json`.
+Use `./stack start --recipe recipes/flash17-jay-exl3-2.8bpw.json` for later launches.
 
 ## LibertAI reduced-context startup (2026-10-26)
 

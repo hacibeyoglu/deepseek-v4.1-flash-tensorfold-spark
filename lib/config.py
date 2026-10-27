@@ -206,7 +206,9 @@ def plan(root, recipe, cluster):
         data = str(Path(node["root"]) / ".stack")
         paths = {"assets": f"{data}/assets/{asset_key}",
                  "engram": f"{data}/engram/{recipe['engram']['revision']}/rank{rank}",
-                 "prepared": f"{data}/prepared/{rid}/{recipe['model']['revision']}",
+                 # The native cache already keys format, builder sources, shard metadata,
+                 # TP layout and DSpark. Unrelated runtime changes must not discard it.
+                 "prepared": f"{data}/prepared/{recipe['model']['revision']}",
                  "state": f"{data}/state/{asset_key}", "cache": f"{data}/cache/{asset_key}"}
         name = f"spark-tf-{cluster['id'][:8]}-r{rank}"
         env = effective_env(recipe, cluster, rank)

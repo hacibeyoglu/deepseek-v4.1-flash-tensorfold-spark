@@ -94,6 +94,16 @@ leaves it intact. Docker build cache remains available for faster rebuilds; no g
 image IDs skip transfer, and both sides' IDs are checked afterward. Preparation runs by the resolved image ID
 because Docker archives do not preserve registry digest references.
 
+The first API startup also converts checkpoint tensors into native per-rank weight images (about 95 GiB
+per node). This can take several minutes after Docker starts; it is separate from Engram packing and AOT
+preparation. Let it finish once, then use `./stack start` for subsequent launches instead of repeating
+`run --setup`. Prepared images stay in `.stack/prepared/<model-revision>/` across runtime updates.
+TensorFold's inner cache key still checks the prepared format, weight-builder sources, checkpoint shard
+metadata, TP layout and DSpark; incompatible images are rebuilt. Existing runtime-specific caches are
+adopted automatically by hard link during preflight, without copying or hashing the weight payloads.
+Completed files and old cache paths are preserved; interrupted `.tmp` files are ignored. A runtime
+update still needs its matching AOT assets, but an unrelated runtime change need not reconvert weights.
+
 Shared assets are prepared on the head only: AOT requirement enumeration and coverage checking use
 **eight CPU workers** for independent decode scans and prefill rows. The head compiles the Triton kernels,
 generates RoPE and Engram host lookup tables, then copies those assets over fabric SSH. The worker checks
