@@ -1,6 +1,7 @@
 """No Docker, network, GPUs, model downloads, or real cluster configuration."""
 from __future__ import annotations
 import copy
+import contextlib
 import hashlib
 import io
 import json
@@ -16,7 +17,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from lib.config import (StackError, choose_network, digest, load_recipe, model_dir,
-                        plan, safe_path, ssh_target, synthetic_cluster, validate_recipe)
+                        pin_image, plan, safe_path, ssh_target, synthetic_cluster, validate_recipe)
 from lib.cluster import Cluster, Remote
 from lib import hub, node, sources
 from scripts import stack
@@ -39,7 +40,7 @@ class EntryPointTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
-        self.recipe = load_recipe(ROOT, "flash17-exl3-2.8bpw")
+        self.recipe = load_recipe(ROOT, "flash17-jay-exl3-2.8bpw")
         self.cluster = synthetic_cluster(ROOT, "192.0.2.11,192.0.2.12")
 
     def test_huggingface_default_and_overrides(self):
@@ -91,6 +92,29 @@ class ConfigTests(unittest.TestCase):
         first = plan(ROOT, self.recipe, self.cluster)
         self.recipe["model"]["revision"] = "a" * 40
         self.assertNotEqual(first["asset_key"], plan(ROOT, self.recipe, self.cluster)["asset_key"])
+
+    def test_recipes_and_runtime_updates_share_tag_but_invalidate_assets(self):
+        original = plan(ROOT, self.recipe, self.cluster)
+        for path in (ROOT / "recipes").glob("*.json"):
+            other = plan(ROOT, load_recipe(ROOT, str(path)), self.cluster)
+            self.assertEqual(original["image"], other["image"])
+        with patch("lib.config.runtime_id", return_value="new-runtime"):
+            updated = plan(ROOT, self.recipe, self.cluster)
+        self.assertEqual(original["image"], "spark-ds41-tensorfold:latest")
+        self.assertEqual(original["image"], updated["image"])
+        self.assertNotEqual(original["asset_key"], updated["asset_key"])
+
+    def test_pin_image_supports_legacy_receipts_without_mutating_them(self):
+        original = plan(ROOT, self.recipe, self.cluster)
+        original["image"] = "spark-tensorfold:old-hash"
+        for n in original["nodes"]:
+            n["command"][n["command"].index("spark-ds41-tensorfold:latest")] = original["image"]
+        pinned = pin_image(original, "sha256:exact")
+        self.assertEqual(pinned["image"], "sha256:exact")
+        self.assertEqual(original["image"], "spark-tensorfold:old-hash")
+        for n in pinned["nodes"]:
+            self.assertIn("sha256:exact", n["command"])
+            self.assertNotIn(original["image"], n["command"])
 
     def test_sampling_defaults_reach_server_without_invalidating_kernels(self):
         before = plan(ROOT, self.recipe, self.cluster)
@@ -155,7 +179,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_dry_run_never_calls_processes(self):
         with patch("subprocess.run", side_effect=AssertionError("dry run spawned a process")), patch("sys.stdout", new=io.StringIO()) as stdout:
-            self.assertEqual(stack.main(["run", "flash17-exl3-2.8bpw", "--setup", "--dry-run", "-n", "192.0.2.11,192.0.2.12"]), 0)
+            self.assertEqual(stack.main(["run", "flash17-jay-exl3-2.8bpw", "--setup", "--dry-run", "-n", "192.0.2.11,192.0.2.12"]), 0)
             data = json.loads(stdout.getvalue())
         self.assertEqual(data["steps"], ["fetch", "download", "build", "prepare", "start", "verify"])
 
@@ -260,7 +284,7 @@ class LifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        recipe = load_recipe(ROOT, "flash17-exl3-2.8bpw")
+        recipe = load_recipe(ROOT, "flash17-jay-exl3-2.8bpw")
         cluster = synthetic_cluster(ROOT, "192.0.2.11,192.0.2.12")
         self.c = Cluster(ROOT, recipe, cluster)
         self.c.root = Path(self.temp.name)
@@ -275,6 +299,12 @@ class LifecycleTests(unittest.TestCase):
         self.c.start()
         self.assertEqual([e[0] for e in self.mutations() if e[2]["argv"][1] == "run"], [1, 0])
         self.assertTrue((self.c.root / ".stack/last-launch.json").exists())
+        receipt = json.loads((self.c.root / ".stack/last-launch.json").read_text())
+        self.assertEqual(receipt["plan"]["image"], "sha256:same")
+        for _, _, request in self.mutations():
+            if request["argv"][1] == "run":
+                self.assertIn("sha256:same", request["argv"])
+                self.assertNotIn("spark-ds41-tensorfold:latest", request["argv"])
 
     def test_unreachable_worker_never_launches_or_stops_head(self):
         self.c.remotes[1].fail_action = "state"
@@ -315,6 +345,20 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(StackError, "bad generation"): self.c.start()
         self.assertTrue(all(n.state["state"] == "exited" for n in self.c.remotes))
         self.assertFalse((self.c.root / ".stack/last-launch.json").exists())
+        commands = [(e[0], e[2]['argv'][1]) for e in self.mutations()]
+        self.assertEqual([rank for rank, action in commands if action == 'logs'], [0, 1])
+        self.assertLess(max(i for i, (_, action) in enumerate(commands) if action == 'logs'),
+                        min(i for i, (_, action) in enumerate(commands) if action == 'stop'))
+
+    def test_startup_log_failure_preserves_original_error_and_cleanup(self):
+        self.c.wait_ready = lambda image: (_ for _ in ()).throw(StackError("rank 0 restarted"))
+        with patch.object(self.c, 'logs', side_effect=StackError('logs unavailable')) as logs, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(StackError, 'rank 0 restarted'):
+                self.c.start()
+        self.assertEqual([call.args[0] for call in logs.call_args_list], ['0', '1'])
+        self.assertTrue(all(n.state['state'] == 'exited' for n in self.c.remotes))
+        self.assertFalse((self.c.root / '.stack/last-launch.json').exists())
 
     def test_running_pair_with_changed_settings_fails_verification(self):
         self.c.start()

@@ -116,7 +116,7 @@ class OrchestrationTransferTests(unittest.TestCase):
         config = synthetic_cluster(ROOT, '192.0.2.11,192.0.2.12')
         config['nodes'][1]['identity'] = 'worker-id'
         config['nodes'][1]['target'] = 'management-alias'
-        self.c = Cluster(ROOT, load_recipe(ROOT, 'flash17-exl3-2.8bpw'), config)
+        self.c = Cluster(ROOT, load_recipe(ROOT, 'flash17-jay-exl3-2.8bpw'), config)
         self.c.remotes = [Mock(), Mock()]
         self.c.doctor = Mock(return_value={'containers': [{'state': 'absent'}] * 2,
                                           'probes': [{}, {'username': 'user'}]})
@@ -220,7 +220,8 @@ class OrchestrationTransferTests(unittest.TestCase):
         self.c.transfer_target = Mock(return_value=self.target)
         self.c.sync_code = Mock()
         self.c.copy_dir = Mock()
-        self.c.pair = Mock(return_value=[{'id': 'same'}] * 2)
+        self.c.pair = Mock(return_value=[{'id': 'same', 'labels': {
+            'io.spark-tensorfold.runtime': self.c.plan['runtime']}}] * 2)
         self.c.sync_image = Mock(return_value='sha256:asset')
         self.c.remotes[0].call.return_value = {'shared': {'identity': 'fixture'}}
         self.c.remotes[1].call.return_value = {'aot': 'verified'}
@@ -234,3 +235,54 @@ class OrchestrationTransferTests(unittest.TestCase):
 
         self.assertEqual(self.c.remotes[1].call.call_args.kwargs['shared'], {'identity': 'fixture'})
         self.c.copy_dir.assert_called_with(f".stack/assets/{self.c.plan['asset_key']}", exclude=('prepared.json',))
+
+    def test_prepare_rejects_matching_ids_with_stale_runtime_before_asset_work(self):
+        self.c.states = Mock(return_value=[{'state': 'absent'}] * 2)
+        self.c.transfer_target = Mock(return_value=self.target)
+        self.c.sync_code = Mock()
+        self.c.copy_dir = Mock()
+        self.c.pair = Mock(return_value=[{'id': 'old', 'labels': {
+            'io.spark-tensorfold.runtime': 'old-runtime'}}] * 2)
+        with patch('lib.cluster.sources.verify'), self.assertRaisesRegex(StackError, 'stale'):
+            self.c.prepare()
+        self.c.remotes[0].call.assert_not_called()
+        self.c.remotes[1].call.assert_not_called()
+
+    def test_build_skips_matching_fingerprints_and_still_checks_both_nodes(self):
+        self.c.transfer_target = Mock(return_value=self.target)
+        self.c.sync_code = Mock()
+        self.c.sync_image = Mock(return_value='sha256:runtime')
+        self.c.remotes[0].call.return_value = {'id': 'sha256:runtime', 'labels': {
+            'io.spark-tensorfold.runtime': self.c.plan['runtime']}}
+        with tempfile.TemporaryDirectory() as tmp, patch('lib.cluster.sources.verify'), \
+                patch('lib.cluster.sources.build_context') as context, patch('lib.cluster.sources.run') as run:
+            self.c.root = Path(tmp)
+            self.c.build()
+            context.assert_not_called()
+            self.assertFalse(any(c.args[0][:2] == ['docker', 'build'] for c in run.call_args_list))
+            self.c.sync_image.assert_called_once_with('spark-ds41-tensorfold:latest', self.target)
+            self.assertEqual(self.c.remotes[1].call.call_args.kwargs['argv'][-1], 'spark-ds41-tensorfold:latest')
+
+    def test_build_updates_only_runtime_without_builder_or_rollback_retention(self):
+        self.c.transfer_target = Mock(return_value=self.target)
+        self.c.sync_code = Mock()
+        self.c.sync_image = Mock(return_value='sha256:new')
+        self.c.remotes[0].call.return_value = {'id': 'sha256:old', 'labels': {
+            'io.spark-tensorfold.runtime': 'old-runtime'}}
+        self.c.pair = Mock()
+        with tempfile.TemporaryDirectory() as tmp, patch('lib.cluster.sources.verify'), \
+                patch('lib.cluster.sources.build_context', return_value='/ctx'), patch('lib.cluster.sources.run') as run:
+            self.c.root = Path(tmp)
+            (self.c.root / '.stack').mkdir()
+            (self.c.root / '.stack/last-launch.json').write_text(json.dumps({'image_id': 'sha256:successful'}))
+            self.c.build()
+            builds = [c.args[0] for c in run.call_args_list if c.args[0][:2] == ['docker', 'build']]
+            self.assertEqual([c[c.index('-t') + 1] for c in builds],
+                             ['spark-ds41-tensorfold:latest'])
+            for c in builds:
+                self.assertIn('io.spark-tensorfold.runtime=' + self.c.plan['runtime'], c)
+                self.assertNotIn('--target', c)
+            for remote in self.c.remotes:
+                self.assertFalse(any(c.kwargs.get('argv', [])[:2] == ['docker', 'tag']
+                                     for c in remote.call.call_args_list))
+            self.c.pair.assert_not_called()

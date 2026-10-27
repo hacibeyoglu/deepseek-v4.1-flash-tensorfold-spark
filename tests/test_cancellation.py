@@ -168,7 +168,7 @@ else:
         self.assert_stopped_and_reusable(pids)
 
     def test_pair_ctrl_c_cancels_calls_in_threads(self):
-        body = f'''    c = Cluster({str(ROOT)!r}, load_recipe({str(ROOT)!r}, "flash17-exl3-2.8bpw"),
+        body = f'''    c = Cluster({str(ROOT)!r}, load_recipe({str(ROOT)!r}, "flash17-jay-exl3-2.8bpw"),
                 synthetic_cluster({str(ROOT)!r}, "192.0.2.1,192.0.2.2"))
     c.remotes = [Remote({str(ROOT)!r}, {{"root": r}}) for r in {[str(self.root), str(self.root / 'other')]!r}]
     c.pair("run", [{{"argv": {[sys.executable, str(self.work), str(self.root)]!r}}},

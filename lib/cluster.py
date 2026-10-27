@@ -15,7 +15,7 @@ import threading
 import time
 import urllib.request
 
-from .config import (StackError, atomic_json, choose_network, digest, plan, read_json,
+from .config import (StackError, atomic_json, choose_network, digest, pin_image, plan, read_json,
                      safe_path, ssh_target, validate_cluster)
 from . import cache_sync, processes, sources
 
@@ -221,12 +221,17 @@ class Cluster:
 
     def build(self):
         target = self.transfer_target()
-        context = sources.build_context(self.root)
+        sources.verify(self.root)
         rid, image = self.plan["runtime"], self.plan["image"]
-        dockerfile = str(self.root / "docker/Dockerfile")
-        common = ["docker", "build", "--progress=plain", "-f", dockerfile, "--build-arg", f"ZIG_COMMIT={rid}"]
-        sources.run([*common, "--target", "build", "-t", image + "-builder", str(context)])
-        sources.run([*common, "--label", f"io.spark-tensorfold.runtime={rid}", "-t", image, str(context)])
+        current = self.remotes[0].call("image", image=image, missing_ok=True)
+        if current is None or current["labels"].get("io.spark-tensorfold.runtime") != rid:
+            context = sources.build_context(self.root)
+            dockerfile = str(self.root / "docker/Dockerfile")
+            common = ["docker", "build", "--progress=plain", "-f", dockerfile,
+                      "--build-arg", f"ZIG_COMMIT={rid}", "--label", f"io.spark-tensorfold.runtime={rid}"]
+            sources.run([*common, "-t", image, str(context)])
+        else:
+            print("Runtime fingerprint matches; skipping Docker build.", flush=True)
         sources.run(["bash", str(self.root / "scripts/check-image.sh"), image])
         self.sync_code()
         image_id = self.sync_image(image, target)
@@ -244,6 +249,8 @@ class Cluster:
             self.copy_dir(relative)
         images = self.pair("image", [{"image": self.plan["image"]}] * 2)
         if images[0]["id"] != images[1]["id"]: raise StackError("Build and copy the same runtime image first")
+        if any(image["labels"].get("io.spark-tensorfold.runtime") != self.plan["runtime"] for image in images):
+            raise StackError("Runtime image is stale; run ./stack build before preparing assets")
         self.remotes[0].call("run", argv=["docker", "pull", self.lock["asset_image"]])
         self.asset_image = self.sync_image(self.lock["asset_image"], target)
         # The head plans, compiles and checks shared assets once. Only packed Engram
@@ -326,6 +333,7 @@ class Cluster:
 
     def start(self):
         expected = self.preflight()
+        launch_plan = pin_image(self.plan, expected)
         states = self.states()
         running = [s.get("running", False) or s["state"] == "restarting" for s in states]
         if all(running): return self.verify(image_id=expected)
@@ -338,27 +346,28 @@ class Cluster:
         try:
             for i in (1, 0):
                 created = True
-                self.remotes[i].call("run", argv=self.nodes[i]["command"])
+                self.remotes[i].call("run", argv=launch_plan["nodes"][i]["command"])
             result = self.wait_ready(expected)
-        except BaseException:
+        except BaseException as failure:
             if created:
+                if isinstance(failure, Exception):
+                    # A peer may be the cause even when readiness first notices
+                    # rank 0 restarting. Read both owned containers before cleanup.
+                    for rank in (0, 1):
+                        try: self.logs(str(rank), tail=80)
+                        except Exception as exc:
+                            print(f"Could not read rank {rank} startup logs: {exc}", file=sys.stderr)
                 try: self.stop()
                 except Exception as exc: print(f"Failed-start cleanup: {exc}", file=sys.stderr)
             raise
         atomic_json(self.root / ".stack/last-launch.json", {"recipe": self.recipe, "cluster": self.config,
-                                                            "plan": self.plan, "image_id": expected})
+                                                            "plan": launch_plan, "image_id": expected})
         return result
 
     def restart(self):
         self.preflight()  # A missing image or stale assets must not stop a healthy pair.
-        previous = self.root / ".stack/last-launch.json"
-        if previous.exists():
-            atomic_json(self.root / ".stack/rollback.json", read_json(previous))
         self.stop()
-        try: return self.start()
-        except Exception:
-            print("Restart failed; stopped containers and caches remain. Use ./stack rollback for the last successful launch.", file=sys.stderr)
-            raise
+        return self.start()
 
     def verify(self, image_id=None):
         image_id = image_id or self.preflight()

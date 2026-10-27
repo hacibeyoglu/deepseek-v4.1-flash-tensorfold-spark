@@ -56,7 +56,12 @@ cached checkpoint files stay unchanged.
 
 The upstream-derived Dockerfile targets ARM64/SM121 with Zig 0.17.0, CUDA 13.0.1, and cuBLAS/cuBLASLt 13.6.0.2.
 CUDA base tags and other APT packages are not fully pinned, so independent rebuilds are not bit-reproducible.
-The resulting runtime image ID is checked on both ranks.
+All recipes share `spark-ds41-tensorfold:latest`. Runtime builds retain only that stack runtime tag.
+The source-lock/patch/Dockerfile fingerprint is checked as a label to reuse matching images or update these
+same tag when inputs change. It still keys prepared assets. The resulting runtime image ID is checked on
+both ranks, and launches pin that ID. Host tests build a temporary compiler image and remove it in a
+cleanup block, including after errors or cancellation. Explicit `--builder-image` overrides remain owned by
+the caller. Docker build cache is retained; no global pruning is performed.
 
 Assets use digest-pinned NGC PyTorch 26.07; preparation checks Triton 3.7.1 and ptxas 13.3.73. The isolated
 Hugging Face client is pinned to 1.24.0. Exact pins live in the source lock.

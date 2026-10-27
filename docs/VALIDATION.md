@@ -1,5 +1,31 @@
 # Validation (2026-10-26)
 
+## LibertAI reduced-context startup (2026-10-26)
+
+The live native profile now uses 262,144 context, four slots and a split/compact 524,288-position shared
+KV pool. The recipe retains 2K prefill, unchanged model/KV precision, native vision, DSpark and the 5 / 4 GiB
+memory floors. Small allocations use the plain arena; expert vectors are reused, stream scratch is lazy,
+index workspace is 32 MiB and SSD staging is 16 MiB. See [settings](RECIPE-SETTINGS.md) for the source deviations.
+
+- Both ranks run runtime `efbc1a1b9c78642d`, image
+  `sha256:c46b4110391485187f41f56ca225be3c684bc16dcf39976f1e0b7aee2777536e`, with asset namespace
+  `8fc8222ebaf694e9`; effective commands/settings match, with zero restarts and no OOM.
+- Startup's measured worst serving headroom was **4.34 GiB head / 5.33 GiB worker**, clearing the 4 GiB floor.
+  The prior replicated pool failed on the worker at 3.58 GiB; split-only and packed-arena trials also failed.
+- Head AOT coverage, copied worker hashes and both rank-specific Engram checks passed.
+- API model identity, health and generation passed (`17 * 23` produced `391`). Four simultaneous fresh
+  prompts of 12,037–12,038 tokens each returned all four expected arithmetic answers, with zero cached tokens.
+  Logs confirm lazy scratch allocation on both ranks. Post-check available memory was about 6.5 / 7.7 GiB.
+
+This validates startup and that text workload, not generation at 262K context, sustained saturation, image/tool
+behavior or comparative performance. The local recipe was updated on both nodes; the source recipe's original
+settings and all failed-start logs were preserved. Head evidence is under
+`.stack/recovery/pool-memory-wnr2yg4m/` (`verified-256k.json`, `concurrency-256k.json`, startup/preparation logs).
+
+Startup-failure handling now reads both owned ranks' log tails before cleanup and preserves the original
+error if diagnostics fail. Tests cover both-rank logging before stop and cleanup despite log errors.
+`./scripts/test.sh` passed all 92 tests, shell syntax checks and the isolated dry-run.
+
 ## AOT planning with partial context pages (2026-10-26)
 
 Runtime `efbc1a1b9c78642d` adds patch 0007. The reported LibertAI setup used a locally edited 500,000-token
@@ -113,7 +139,8 @@ The local suite requires loopback sockets for synthetic transport tests. No Spar
 first, then each new recipe. Verify both ranks and generation, DSpark, memory under representative concurrent
 long prompts, and actual AOT coverage. The new packs add about 6.5 GiB of weights across the pair. Host tests
 do not establish GPU kernel correctness, memory fit, maximum context, modalities, quality, or performance.
-Runtime changes create a new image and asset namespace; retain the earlier runtime for rollback.
+Runtime changes update `spark-ds41-tensorfold:latest` and create a new asset namespace.
+Launch receipts pin immutable image IDs; builds retain no separate rollback image.
 
 ## Earlier ARM64 baseline
 
@@ -165,15 +192,17 @@ live Hugging Face/Xet cancellation and network-failure behavior on the Sparks re
 ./stack run flash17-exl3-2.8bpw --setup --dry-run -n 192.0.2.11,192.0.2.12
 ```
 
-On an ARM64 Spark with the builder and asset images available:
+On an ARM64 Spark with fetched sources and the asset image available:
 
 ```bash
 ./stack fetch
-./stack test-runtime --builder-image <builder-image>
+./stack test-runtime
 ./stack test-assets
 ```
 
-The default builder is produced by `./stack build`. Test evidence stays in ignored `.stack/`.
+Host tests build and remove a temporary builder image, including after failure or cancellation.
+Use `--builder-image IMAGE` to supply an existing image that the tests will leave intact.
+Test evidence stays in ignored `.stack/`.
 
 ## Fresh deployment test
 

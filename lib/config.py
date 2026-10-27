@@ -8,6 +8,9 @@ import math
 import os
 from pathlib import Path
 import re
+import copy
+
+RUNTIME_IMAGE = "spark-ds41-tensorfold:latest"
 
 
 class StackError(RuntimeError):
@@ -107,6 +110,16 @@ def runtime_id(root):
     return digest({"lock": lock, "files": {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in files}})[:16]
 
 
+def pin_image(generated, image_id):
+    """Save/launch the resolved image even after a mutable tag moves."""
+    pinned = copy.deepcopy(generated)
+    for node in pinned["nodes"]:
+        command = node["command"]
+        command[command.index(pinned["image"])] = image_id
+    pinned["image"] = image_id
+    return pinned
+
+
 def model_dir(node, model, container=False):
     cache = "/hf/hub" if container else node["hub_cache"]
     return f'{cache}/models--{model["repo"].replace("/", "--")}/snapshots/{model["revision"]}'
@@ -187,7 +200,7 @@ def plan(root, recipe, cluster):
     asset_key = digest({"runtime": rid, "model": recipe["model"], "engram": recipe["engram"],
                         "env": recipe["env"], "context": recipe["serve"]["context"],
                         "slots": recipe["serve"]["slots"]})[:16]
-    image = f"spark-tensorfold:{rid}"
+    image = RUNTIME_IMAGE
     result = {"runtime": rid, "asset_key": asset_key, "image": image, "recipe": recipe, "nodes": []}
     for rank, node in enumerate(cluster["nodes"]):
         data = str(Path(node["root"]) / ".stack")

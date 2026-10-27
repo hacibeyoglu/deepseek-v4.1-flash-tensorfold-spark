@@ -15,7 +15,7 @@ class SharedAssetsTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        recipe = load_recipe(ROOT, 'flash17-exl3-2.8bpw')
+        recipe = load_recipe(ROOT, 'flash17-jay-exl3-2.8bpw')
         cfg = synthetic_cluster(self.root, '192.0.2.11,192.0.2.12')
         cfg['nodes'][1].update(root=str(self.root), hub_cache=str(self.root / 'hub'))
         generated = plan(ROOT, recipe, cfg)

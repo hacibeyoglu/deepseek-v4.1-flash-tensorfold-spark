@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import sys
+import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -22,9 +23,9 @@ def parser():
     ap = argparse.ArgumentParser(description=__doc__)
     commands = ap.add_subparsers(dest="action", required=True)
     for name in ("setup", "fetch", "download", "build", "prepare", "start", "stop", "restart",
-                 "status", "logs", "doctor", "verify", "verify-weights", "rollback", "plan", "run", "test-runtime", "test-assets"):
+                 "status", "logs", "doctor", "verify", "verify-weights", "plan", "run", "test-runtime", "test-assets"):
         sub = commands.add_parser(name)
-        sub.add_argument("--recipe", default="flash17-exl3-2.8bpw", help="Recipe name or JSON path")
+        sub.add_argument("--recipe", default="flash17-jay-exl3-2.8bpw", help="Recipe name or JSON path")
         sub.add_argument("--config", type=Path, default=ROOT / "cluster.json")
         sub.add_argument("--dry-run", action="store_true", help="Print only; never probe, download, or mutate")
         sub.add_argument("-n", "--nodes", help="Explicit head,worker IPv4 addresses for isolated dry-runs only")
@@ -49,7 +50,7 @@ def parser():
         if name in ("run", "download"):
             sub.add_argument("--verify-weights", action="store_true", help="Explicitly hash checkpoint tensors on both nodes")
         if name == "test-runtime":
-            sub.add_argument("--builder-image", help="Default: this runtime's builder image")
+            sub.add_argument("--builder-image", help="Use an existing image; default: build and remove a temporary test image")
     return ap
 
 
@@ -60,6 +61,29 @@ def locked():
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc: raise StackError("Another head-side stack operation is in progress") from exc
         yield
+
+
+@contextlib.contextmanager
+def runtime_builder(image=None):
+    if image is not None:
+        yield image
+        return
+    context = sources.build_context(ROOT)
+    image = "spark-ds41-tensorfold:test-builder-" + uuid.uuid4().hex
+    try:
+        sources.run(["docker", "build", "--progress=plain", "-f", str(ROOT / "docker/Dockerfile"),
+                     "--target", "build", "--label", f"io.spark-tensorfold.runtime={runtime_id(ROOT)}",
+                     "-t", image, str(context)])
+        yield image
+    finally:
+        failed = sys.exc_info()[0] is not None
+        with processes.cleaning_up():
+            result = processes.run(["docker", "image", "rm", "--no-prune", image], capture_output=True, text=True)
+            if result.returncode and "no such image" not in result.stderr.lower():
+                message = f"Could not remove temporary test image {image}: {result.stderr.strip()}"
+                if not failed:
+                    raise StackError(message)
+                print(message, file=sys.stderr)
 
 
 def runtime_tests(image):
@@ -116,7 +140,8 @@ def main(argv=None):
         with locked(): sources.fetch(ROOT, args.source_cache, args.python_cache)
         return 0
     if args.action == "test-runtime":
-        with locked(): runtime_tests(args.builder_image or f"spark-tensorfold:{runtime_id(ROOT)}-builder")
+        with locked(), runtime_builder(args.builder_image) as image:
+            runtime_tests(image)
         return 0
     if args.action == "test-assets":
         import os
@@ -160,15 +185,6 @@ def main(argv=None):
             else: result = cluster.start()
         elif args.action == "download":
             result = cluster.download(verify_weights=args.verify_weights)
-        elif args.action == "rollback":
-            previous = read_json(ROOT / ".stack/rollback.json")
-            restored = Cluster(ROOT, previous["recipe"], previous["cluster"])
-            # Saved concrete commands and asset paths allow rollback even after source-lock updates.
-            restored.plan = previous["plan"]
-            restored.nodes = previous["plan"]["nodes"]
-            restored.preflight()
-            cluster.stop()
-            result = restored.start()
         else:
             result = getattr(cluster, args.action.replace("-", "_"))()
         if result is not None: print(json.dumps(result, indent=2))

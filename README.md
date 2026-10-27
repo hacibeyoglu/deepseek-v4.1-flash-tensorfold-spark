@@ -45,10 +45,11 @@ for example, `./scripts/start.sh` is equivalent to `./stack start`.
 | `./stack fetch` | Export pinned sources and apply patches |
 | `./stack download` | Download weights/Engram shards on the head; sync and check worker files and sizes |
 | `./stack verify-weights` | Explicitly check cached checkpoint SHA256 hashes on both nodes, without Hub access or downloads |
-| `./stack build` | Build images and verify the same runtime image on both nodes; requires fetched sources |
+| `./stack build` | Build the runtime and verify the same image on both nodes; requires fetched sources |
+| `./stack test-runtime` | Build a temporary test image, run host tests, then remove that image |
 | `./stack prepare` | Pull the preparation image on the head and copy it; pack Engram, generate assets, and check AOT coverage |
 | `./stack start` / `./stack stop` | Start worker then head and verify generation / drain and stop both ranks |
-| `./stack restart` / `./stack rollback` | Recreate with current settings / restore the configuration saved before restart |
+| `./stack restart` | Recreate with current settings |
 | `./stack status` / `./stack logs --rank both` | Inspect state and logs |
 | `./stack verify` | Check image, effective settings, model, health, and generation |
 | `./scripts/test.sh` | Run local tests and an isolated dry-run; runtime/asset checks are in [VALIDATION.md](docs/VALIDATION.md) |
@@ -82,6 +83,13 @@ and final statistics, with line-buffered output. Explicit checksum verification 
 and can take time even when the cache is already populated. API readiness and generation checks remain automatic.
 
 `./stack build` builds the runtime image on the head and streams `docker save` into worker `docker load`.
+All recipes use **`spark-ds41-tensorfold:latest`**, the only retained stack runtime tag.
+Builds skip images whose runtime fingerprint already matches the source lock, patches, and Dockerfile.
+Updating those inputs replaces the same tags. Recipe changes reuse the runtime and select their own assets.
+The fingerprint remains in image labels and asset paths; preparation/start reject a stale runtime.
+Launches pin exact image IDs. `./stack test-runtime` builds a temporary compiler/test image and removes it
+after success, failure, or cancellation. `--builder-image IMAGE` uses an existing caller-owned image and
+leaves it intact. Docker build cache remains available for faster rebuilds; no global pruning is performed.
 `./stack prepare` pulls the pinned preparation image on the head and distributes it the same way. Matching
 image IDs skip transfer, and both sides' IDs are checked afterward. Preparation runs by the resolved image ID
 because Docker archives do not preserve registry digest references.
@@ -119,28 +127,29 @@ installing the download client with:
 
 ## Configuration
 
-`recipes/flash17-exl3-2.8bpw.json` holds portable model settings; `cluster.json` holds local paths and topology. Source and
+`recipes/flash17-jay-exl3-2.8bpw.json` holds portable model settings; `cluster.json` holds local paths and topology. Source and
 model revisions are pinned. To use another recipe, pass `--recipe path/to/recipe.json`.
 
-Two additional recipes are **experimental and await TP=2 GPU qualification**:
+Two additional recipes are available; Mia remains experimental, while LibertAI has limited TP=2 text validation:
 
 | Recipe | Checkpoint |
 |---|---|
-| `flash17-eaq-v1-exl3-2.9bpw` | Mia EAQ v1, EXL3 2.9 bpw |
+| `flash17-mia-exl3-2.9bpw` | Mia EAQ v1, EXL3 2.9 bpw |
 | `flash17-libertai-exl3-2.9bpw` | LibertAI, EXL3 2.9 bpw |
 
-Use either name with `./stack run NAME --setup`. Their serving settings follow their pinned source stacks:
-both use 2K prefill, a shared 1,048,576-position replicated KV pool and full expert top-k routing; EAQ has four
-slots and RAM-only session reuse, while LibertAI has eight slots and a 32-GiB SSD session tier. Sampling defaults
-also differ. See [recipe settings and origin mappings](docs/RECIPE-SETTINGS.md) for exact values and runtime limits.
-Both preserve the existing precision and memory guards. Their weights are about 6.5 GiB larger in total, so
-memory fit still needs testing. They use pinned Hub hashes because these packs omit `SHA256SUMS`, and derive AOT
+Use either name with `./stack run NAME --setup`. Both use 2K prefill and full expert top-k routing. Mia keeps
+four slots, a replicated 1,048,576-position pool and RAM-only session reuse. LibertAI uses four slots,
+262,144 context per request and a shared split 524,288-position pool, with buffer reuse and a 32-GiB SSD tier
+to fit the native runtime's memory budget. Startup and four fresh approximately 12K-token text requests passed;
+maximum context, image/tool behavior and performance remain unqualified. See [recipe settings and origin
+mappings](docs/RECIPE-SETTINGS.md) for values and [validation](docs/VALIDATION.md) for measured limits.
+Both preserve the existing precision and memory guards. They use pinned Hub hashes because these packs omit `SHA256SUMS`, and derive AOT
 kernel requirements from their own headers. EAQ v1.1 and display-KV are not included.
 
 ```bash
 # Isolated plan: no discovery, network calls, downloads, or writes
 # Replace <HEAD_IP> and <WORKER_IP> with IPv4 addresses, head first.
-./stack run flash17-exl3-2.8bpw --setup --dry-run -n "<HEAD_IP>,<WORKER_IP>"
+./stack run flash17-jay-exl3-2.8bpw --setup --dry-run -n "<HEAD_IP>,<WORKER_IP>"
 ./stack start --dry-run             # Plan using saved cluster configuration
 
 # Apply matching overrides during preparation and startup
@@ -167,9 +176,11 @@ partial pairs or conflicting workloads. Preparation refuses to change assets mou
 Worker synchronization preserves `.stack/` and requires an empty directory or one already owned by this stack.
 
 Both ranks use `unless-stopped`. Stop disables restart on both before draining. Failed startup stops newly
-launched ranks and retains their data. Restart saves a rollback receipt; rollback is explicit. Operations are locked.
+launched ranks and retains their data. Restart recreates the pair with current settings. Operations are locked.
 Successful readiness checks both ranks, API model identity, health, and actual generation. Maximum context,
 concurrency, modalities, and performance need separate qualification.
+Failed startups print the last 80 log lines from each owned rank before cleanup, including peer-side causes
+such as `PoolDoesNotFit`; a log-read failure does not replace the original startup error.
 
 Downloads run in the foreground. Press Ctrl+C once to cancel: the launcher waits for its downloader and
 transfer processes to stop, escalating to a forced stop if needed, then exits with status 130. Further Ctrl+C

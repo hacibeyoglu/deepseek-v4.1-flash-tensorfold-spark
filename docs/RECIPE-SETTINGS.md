@@ -1,17 +1,18 @@
 # Recipe settings and their origins
 
 Reviewed 2026-10-26 against the pinned launchers and engine readers linked below. These are translations
-into this repository's combined Zig runtime, not copies of another engine's environment. The experimental
-2.9 bpw profiles still require ARM64/GB10 preparation and GPU qualification.
+into this repository's combined Zig runtime, not copies of another engine's environment.
+Mia's experimental 2.9 bpw profile remains unqualified on GPU. LibertAI's reduced-context profile passed the limited
+live checks described in [validation](VALIDATION.md); it is not maximum-context or performance qualification.
 
 ## Effective profiles
 
 | Setting | Jayleaton 2.8 bpw | Mia EAQ v1 2.9 bpw | LibertAI 2.9 bpw |
 |---|---|---|---|
-| Context per request | 1,048,576 | 1,048,576 | 1,048,576 |
-| Concurrent slots | 4 | 4 | 8 |
-| Shared KV pool positions | 2,100,000 | 1,048,576 | 1,048,576 |
-| KV split / compact exchange | On / on | Off / off | Off / off |
+| Context per request | 1,048,576 | 1,048,576 | 262,144 |
+| Concurrent slots | 4 | 4 | 4 |
+| Shared KV pool positions | 2,100,000 | 1,048,576 | 524,288 |
+| KV split / compact exchange | On / on | Off / off | On / on |
 | Expert routing | Top-p 0.85 | Full configured top-k | Full configured top-k |
 | Prefill chunk / rows | 4096 / 4096 | 2048 / 2048 | 2048 / 2048 |
 | 4K prefill opt-in | On | Off | Off |
@@ -73,14 +74,33 @@ and [launcher](https://github.com/0rand/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold
 at `887bec7bc0a45286d0d3ae7a2ed04fd067fb9d55`. This is the ordinary Python serving lane;
 display-KV settings are separate experiments and are not copied.
 
-- `PARALLEL=8`, `PREFILL_CHUNK=2048`, `SPILL_GIB=32`, `TEMPERATURE=0.4`, `TOP_P=1.0`, thinking,
-  high effort, vision, and DSpark are reflected in the local recipe.
+- The source has `PARALLEL=8` and 1M context. The local native profile uses four slots, 262,144 context
+  and a split 524,288-position pool after live memory-fit checks. It retains `PREFILL_CHUNK=2048`,
+  `SPILL_GIB=32`, `TEMPERATURE=0.4`, `TOP_P=1.0`, thinking, high effort, vision and DSpark.
 - The pinned checkpoint contains no `generation_config.json`, and this Python stack supplies no top-k cut;
   local `serve.top_k=0` makes that explicit.
 - The source [MoE path](https://github.com/Elevatormusic/TensorFold/blob/07aa02585f64cfb04c60a96de6554c0d4708ed46/src/tensorfold/families/deepseek_v41/cuda/model.py)
   uses its configured top-k without an expert top-p cut. The shared cache is replicated and spans the context.
 - Its [spill reader](https://github.com/Elevatormusic/TensorFold/blob/07aa02585f64cfb04c60a96de6554c0d4708ed46/src/tensorfold/families/deepseek_v41/cuda/spill.py)
   defaults `TF_DS_SPILL_MIN` to 4096; map this to `TF_DSV41_SESSION_DISK_MIN=4096`.
+
+### LibertAI native memory adaptation
+
+The original replicated 1M pool failed the native measured boot guard on these Sparks. Split KV improved
+the worker's fit, but the head's vision tower still left too little headroom at 500,000 context. The current
+recipe follows the user's request to reduce context, with these explicit native-runtime adaptations:
+
+- Four slots share 524,288 pool positions; each request may use up to 262,144. Four simultaneous full-window
+  requests do not fit this pool. Output reservations also count toward admission.
+- `TF_DSV41_KV_SPLIT=1` and `TF_DSV41_KV_SPLIT_COMPACT=1` shard ownership without lowering KV precision.
+- `TF_DSV41_ARENA=plain` groups small allocations. `TF_DSV41_EX_STACKS=1` reuses expert vectors in place
+  (0.55 GiB saved per rank in the observed boot). `TF_DSV41_STREAM_LAZY=1` allocates stream top-k scratch
+  during the prompts that need it; the four-prompt check exercised this path at 128 MiB per allocation.
+- Index workspace is 32 MiB (`TF_DSV41_INDEX_BUDGET_MIB`), with 16 MiB of SSD staging
+  (`TF_DSV41_SESSION_STAGING_MIB`). These can trade prefill/SSD throughput for memory; no speed comparison
+  was performed. Prefill chunks remain 2048 tokens.
+- The 5 / 4 GiB memory floors, measured boot guard, model pin, numerical precision and native vision remain.
+  `TF_DSV41_ARENA=pack` was not selected: VMM allocation failed and the fallback had more slack on these hosts.
 
 ## Differences that remain
 

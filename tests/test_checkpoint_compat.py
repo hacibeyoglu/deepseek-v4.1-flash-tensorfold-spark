@@ -147,7 +147,7 @@ class HubChecksumTests(unittest.TestCase):
 
 class RecipeCompatibilityTests(unittest.TestCase):
     def test_setup_and_download_require_explicit_verification_flag(self):
-        for action in (['run', 'flash17-exl3-2.8bpw', '--setup'], ['download']):
+        for action in (['run', 'flash17-jay-exl3-2.8bpw', '--setup'], ['download']):
             for verify in (False, True):
                 with patch('scripts.stack.Cluster') as cluster, \
                         patch('scripts.stack.read_json', return_value={}), \
@@ -161,13 +161,13 @@ class RecipeCompatibilityTests(unittest.TestCase):
             stack.main(['run', '--verify-weights'])
 
     def test_new_recipes_keep_precision_and_get_separate_assets(self):
-        base = load_recipe(ROOT, 'flash17-exl3-2.8bpw')
+        base = load_recipe(ROOT, 'flash17-jay-exl3-2.8bpw')
         cluster = synthetic_cluster(ROOT, '192.0.2.11,192.0.2.12')
         old = plan(ROOT, base, cluster)
         assets = {old['asset_key']}
         self.assertNotIn('TF_DSV41_NEEDS_MODEL', old['nodes'][0]['env'])
         self.assertNotIn('verification', base['model'])
-        for name in ('flash17-eaq-v1-exl3-2.9bpw', 'flash17-libertai-exl3-2.9bpw'):
+        for name in ('flash17-mia-exl3-2.9bpw', 'flash17-libertai-exl3-2.9bpw'):
             recipe = load_recipe(ROOT, name)
             self.assertEqual(recipe['engram'], base['engram'])
             for key in ('TF_DSV41_INDEX_KV', 'TF_DSV41_FLOOR_GIB', 'TF_DSV41_FLOOR_HARD_GIB',
