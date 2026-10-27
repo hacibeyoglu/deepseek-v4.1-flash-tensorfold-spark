@@ -279,22 +279,47 @@ class Cluster:
         s = self.recipe["serve"]
         deadline = time.monotonic() + s["ready_timeout"]
         last = "waiting for model loading"
-        while time.monotonic() < deadline:
-            states = self.states()
-            for rank, state in enumerate(states):
-                if (not state.get("running") or state["state"] != "running" or state["image"] != image_id
-                        or state["restarts"] or state["oom"]):
-                    raise StackError(f"rank {rank} failed readiness: {state}")
-            try:
-                models = api(s["port"], "/v1/models")
-                if s["name"] in [m["id"] for m in models.get("data", [])]:
-                    return self.verify(image_id=image_id)
-                last = "API answered with a different model"
-            except (OSError, ValueError) as exc:
-                last = str(exc)
-            print(f"Loading: {last}", flush=True)
-            time.sleep(5)
-        raise StackError(f"Readiness timed out after {s['ready_timeout']} s: {last}")
+        interactive = sys.stdout.isatty()
+        stopped = threading.Event()
+
+        def indicate_wait():
+            frames = "|/-\\"
+            frame = 0
+            while not stopped.is_set():
+                print(f"\r[{frames[frame % len(frames)]}] Waiting for API to come online...",
+                      end="", flush=True)
+                frame += 1
+                stopped.wait(0.15)
+
+        indicator = threading.Thread(target=indicate_wait, daemon=True) if interactive else None
+        if indicator:
+            indicator.start()
+        else:
+            print("Waiting for API to come online...", flush=True)
+        try:
+            while time.monotonic() < deadline:
+                states = self.states()
+                for rank, state in enumerate(states):
+                    if (not state.get("running") or state["state"] != "running" or state["image"] != image_id
+                            or state["restarts"] or state["oom"]):
+                        raise StackError(f"rank {rank} failed readiness: {state}")
+                try:
+                    models = api(s["port"], "/v1/models")
+                    if s["name"] in [m["id"] for m in models.get("data", [])]:
+                        break
+                    last = "API answered with a different model"
+                except (OSError, ValueError) as exc:
+                    last = str(exc)
+                time.sleep(5)
+            else:
+                raise StackError(f"Readiness timed out after {s['ready_timeout']} s: {last}")
+        finally:
+            stopped.set()
+            if indicator:
+                indicator.join()
+                print("\r" + " " * 48 + "\r", end="", flush=True)
+        print("API online; verifying model and generation...", flush=True)
+        return self.verify(image_id=image_id)
 
     def start(self):
         expected = self.preflight()
