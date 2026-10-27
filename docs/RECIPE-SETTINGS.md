@@ -26,6 +26,10 @@ into this repository's combined Zig runtime, not copies of another engine's envi
 accepts 1–16; this launcher exposes 1–8 to cover the selected source profiles. Supporting eight in command
 generation does not establish eight-request memory fit or throughput.
 
+Context limits need not be multiples of 256. Runtime patch 0007 makes AOT planning round only the internal
+page tables, as the serving allocator already does; a limit such as 500,000 remains exactly 500,000 tokens.
+The shared pool is a separate capacity and is not resized to the request limit.
+
 Sampling is stored as optional `serve.temperature`, `serve.top_p`, and `serve.top_k` and passed as native
 CLI flags, because this runtime has no corresponding `TF_DSV41_*` environment readers. A top-k of zero
 disables that sampling cut. Requests can override these defaults. Sampling-only changes require recreation;

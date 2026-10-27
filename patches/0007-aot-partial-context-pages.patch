@@ -1,0 +1,99 @@
+--- a/engine/zig/zig/build/cuda.zig
++++ b/engine/zig/zig/build/cuda.zig
+@@ -297,7 +297,9 @@
+     rows.addImport("cuda", cuda);
+     rows.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors_root.zig"), .target = host, .optimize = .debug, .link_libc = true }));
+     rows.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
+-    rows.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
++    const rows_tp = @import("tp.zig").module(b, host, .debug, cuda);
++    rows.addImport("tp", rows_tp);
++    rows.addImport("kv", @import("kv.zig").module(b, host, .debug, cuda, rows_tp));
+     const rows_run = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
+     b.step("test-dsv41-rows", "DeepSeek-V4.1 row mode (several slots) on the real emitter, host only").dependOn(&rows_run.step);
+     step.dependOn(&rows_run.step);
+--- a/engine/zig/zig/src/families/deepseek_v41/aot_needs.zig
++++ b/engine/zig/zig/src/families/deepseek_v41/aot_needs.zig
+@@ -262,15 +262,21 @@
+ 
+ /// The served pool as model.zig opens it (kv_state.optionsFromEnv; null: no pool); TF_DSV41_NEEDS_POOL=1 / 0 forces it.
+ pub fn poolFromEnv(limit: i64, world: u32) !?block.Pool {
++    if (limit <= 0 or world == 0) return error.InvalidPoolShape;
+     const force: ?bool = if (std.c.getenv("TF_DSV41_NEEDS_POOL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else null;
+     const ko = try kvs.optionsFromEnv(@intCast(limit), world);
+     if (!(force orelse (ko != null))) return null;
+-    const pages = @divExact(limit, block.Pool.page);
++    // A slot rounds its capacity up; the physical pool is rounded separately by
++    // kv_state.optionsFromEnv. They differ for partial pages and non-default pools.
++    const sessions = @import("kv").sessions;
++    const page: u64 = @intCast(block.Pool.page);
++    const pts: i64 = @intCast(sessions.pool.pagesFor(@intCast(limit), @intCast(page)));
++    const pages: i64 = if (ko) |k| @intCast(k.tokens / page) else @divTrunc(pts + world - 1, world) * world;
+     const split = if (ko) |k| k.split else envOn("TF_DSV41_KV_SPLIT", false);
+     return .{
+-        .comp_pages = if (split) @divExact(pages, 2) + 2 else pages + 1,
++        .comp_pages = if (split) @divExact(pages, world) + 2 else pages + 1,
+         .ik_pages = pages + 1,
+-        .pts = pages,
++        .pts = pts,
+         .split = split,
+         .early = split and earlyOn(),
+         .union_cap = if (ko) |k| @intCast(k.union_cap) else 128 << 20,
+@@ -690,6 +696,58 @@
+     }
+ }
+ 
++test "aot-needs: partial context pages match the served allocator on both ranks" {
++    const kv = @import("kv");
++    const sessions = kv.sessions;
++    defer for ([_][:0]const u8{ "TF_DSV41_POOL_TOKENS", "TF_DSV41_KV_SPLIT", "TF_DSV41_NEEDS_POOL" }) |k| {
++        _ = unsetenv(k);
++    };
++    _ = unsetenv("TF_DSV41_NEEDS_POOL");
++    for ([_][:0]const u8{ "1048576", "2100000" }) |tokens| {
++        _ = setenv("TF_DSV41_POOL_TOKENS", tokens, 1);
++        for ([_]bool{ false, true }) |split| {
++            _ = setenv("TF_DSV41_KV_SPLIT", if (split) "1" else "0", 1);
++            // 500000 is the reported crash; 500225 needs an odd number of slot
++            // pages. Cover a short partial page and the unchanged 1M default too.
++            for ([_]i64{ 2049, 500000, 500225, 1048576 }) |limit| {
++                const got = (try poolFromEnv(limit, 2)).?;
++                const opts = (try kvs.optionsFromEnv(@intCast(limit), 2)).?;
++                for ([_]u32{ 0, 1 }) |rank| {
++                    var layout: kv.Layout = .{ .opts = .{ .split = split } };
++                    try layout.add(2, 2);
++                    var pool = try sessions.Pool.init(testing.allocator, layout.pool(), opts.tokens, if (split) 2 else 1, if (split) rank else 0);
++                    defer pool.deinit();
++                    const slot = try pool.newSlot(@intCast(limit));
++                    const fams = layout.families();
++                    try testing.expectEqual(@as(i64, slot.max_pages), got.pts);
++                    try testing.expectEqual(@as(i64, pool.familyTensorPages(fams[0])), got.comp_pages);
++                    try testing.expectEqual(@as(i64, pool.familyTensorPages(fams[1])), got.ik_pages);
++                    try testing.expectEqual(@as(u64, @intCast(limit)), slot.capacity);
++                    try testing.expectEqual(split, got.split);
++                }
++            }
++        }
++    }
++}
++
++test "aot-needs: forced partial-page pools round physical residues separately" {
++    defer for ([_][:0]const u8{ "TF_DSV41_POOL_TOKENS", "TF_DSV41_KV_SPLIT", "TF_DSV41_NEEDS_POOL" }) |k| {
++        _ = unsetenv(k);
++    };
++    _ = unsetenv("TF_DSV41_POOL_TOKENS");
++    _ = setenv("TF_DSV41_NEEDS_POOL", "1", 1);
++    for ([_]bool{ false, true }) |split| {
++        _ = setenv("TF_DSV41_KV_SPLIT", if (split) "1" else "0", 1);
++        const got = (try poolFromEnv(500225, 2)).?;
++        try testing.expectEqual(@as(i64, 1955), got.pts);
++        try testing.expectEqual(@as(i64, 1957), got.ik_pages);
++        try testing.expectEqual(@as(i64, if (split) 980 else 1957), got.comp_pages);
++    }
++    try testing.expectError(error.InvalidPoolShape, poolFromEnv(0, 2));
++    try testing.expectError(error.InvalidPoolShape, poolFromEnv(-1, 2));
++    try testing.expectError(error.InvalidPoolShape, poolFromEnv(500000, 0));
++}
++
+ test "aot-needs: a launch reduces to Triton's specialization (constexprs, == 1, % 16, width, alignment)" {
+     var params = [_]Param{
+         .{ .name = "X", .constexpr = false, .nospec = false, .noalign = false },

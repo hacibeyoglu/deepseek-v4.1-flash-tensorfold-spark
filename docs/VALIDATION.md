@@ -1,5 +1,45 @@
 # Validation (2026-10-26)
 
+## AOT planning with partial context pages (2026-10-26)
+
+Runtime `efbc1a1b9c78642d` adds patch 0007. The reported LibertAI setup used a locally edited 500,000-token
+context and four slots, with a separate 1,048,576-position replicated pool. `aot-needs` aborted in
+`poolFromEnv` because it required the context to divide exactly into 256-token pages. The serving allocator
+already rounds the internal slot table up while retaining the exact request capacity.
+
+The planner now uses that allocator's page rounding and the configured physical pool's independently rounded
+size. Regressions compare its slot table, compressed/index tensor page counts and split flag with real
+allocator objects on both ranks: replicated/split, 2049/500000/500225/1048576 context, and 1,048,576/2,100,000
+pool requests. They also cover forced pools, odd slot-page counts and invalid shapes. No context, pool,
+precision or numerical kernel is changed by this fix.
+
+- Local orchestration suite: 81 tests passed, shell syntax and isolated dry-run passed.
+- ARM64 combined `zig build test test-golden`: all 103 steps passed; the final run executed 259 passing
+  tests and skipped five, with the remaining results reused from the same disposable build cache.
+- Native ReleaseSafe host executable build: 30/30 steps passed, without CUDA fatbins or GPU execution.
+- The built `tf-dsv41-m1 aot-needs` completed against the actual cached LibertAI checkpoint headers with
+  the user's unchanged 500,000-token context, four slots and 1,048,576-position pool: 192,215 programs,
+  136 kernel variants. It enumerated prefill, images, CED replay and DSpark requirements without a panic.
+  This was CPU metadata planning, not Triton compilation, coverage checking or inference.
+- Fresh offline source assembly applied the full patch set without fuzz; repeat fetch verified.
+  The assembled engine tree matches the tested tree (`8d0f2d836652ef67edbdc9c574775ccf0d398bc34270295c26276bd7d75e25f8`).
+
+Native tests used the existing Zig 0.17.0 builder on spark01 in a disposable source copy, with networking
+and GPU access disabled. Both nodes had no running containers before inspection; the user-edited recipe,
+managed source exports and model caches were preserved. Raw remote evidence:
+`/tmp/tf-aot-pages.ua6URmhr/host-tests-final.log`, `host-build.log`, `real-aot.log` and `fetch-final.log`.
+
+Update the checkout and rerun the original command:
+
+```bash
+git pull --ff-only
+./stack run recipes/flash17-libertai-exl3-2.9bpw.json --setup
+```
+
+The runtime ID change rebuilds the executable
+and selects fresh asset/session namespaces; completed model downloads are reused. Host tests do not
+establish live generation, memory fit or maximum-context GPU qualification.
+
 ## Origin-matched serving profiles (2026-10-26)
 
 The [recipe settings audit](RECIPE-SETTINGS.md) records pinned source launchers, model cards, native

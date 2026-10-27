@@ -36,6 +36,10 @@ Serving defaults, source-to-runtime mappings and deliberate differences are in [
   packs/checks rank-specific Engram data. AOT enumeration consumes the shared serving settings and TP
   world size, not TP rank; the existing model-derived width plan already uses rank 0 on both nodes.
   RoPE and Engram host lookup generators take only the shared model config/tokenizer.
+- **0007:** Makes AOT pool planning use the serving allocator's ceiling page count for a request's context,
+  and the separately rounded configured pool for physical tensor sizes. Fixes `exact division produced remainder`
+  for contexts such as 500,000 without changing the request limit or pool budget. Host regressions compare
+  replicated and split plans against the real allocator on both ranks, including odd slot-page counts.
 
 The new recipes were checked against code in
 [MiaAI-Lab's stack](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/tree/27741e176a9e5b98c10c9c7d012fd3e4fcdc19b6)
