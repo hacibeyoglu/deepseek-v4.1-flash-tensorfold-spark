@@ -1,7 +1,8 @@
 # Source provenance
 
-Code and checkpoint metadata checked on 2026-10-26. Full pins are in [sources.lock.json](../sources.lock.json)
-and [recipes/flash17-exl3-2.8bpw.json](../recipes/flash17-exl3-2.8bpw.json).
+Code and checkpoint metadata checked on 2026-10-26; `main-0rand` runtime equivalence rechecked on
+2026-10-27 (details below). Full pins are in [sources.lock.json](../sources.lock.json)
+and [recipes/flash17-jay-exl3-2.8bpw.json](../recipes/flash17-jay-exl3-2.8bpw.json).
 Serving defaults, source-to-runtime mappings and deliberate differences are in [recipe settings](RECIPE-SETTINGS.md).
 
 | Component | Source |
@@ -14,6 +15,27 @@ Serving defaults, source-to-runtime mappings and deliberate differences are in [
 | Engram source | [DeepSeek original, revision `1bae0e108899`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/tree/1bae0e1088993b9b82de08f59de5be5a34e42170) |
 | Experimental EAQ v1 checkpoint | [Mia EXL3 2.9 bpw, revision `45ee5d0fd106`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw/tree/45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b) |
 | Experimental LibertAI checkpoint | [LibertAI EXL3 2.9 bpw, revision `afc7aa0aab98`](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw/tree/afc7aa0aab98ee735c0f54e0a122019af1ac08f1) |
+
+## main-0rand review, 2026-10-27
+
+Reviewed [0rand `055c4aefa879`](https://github.com/0rand/deepseek-v41-tensorfold-spark/commit/055c4aefa8794f1876e2894d666693f3784bb0fa),
+the `main-0rand` head at review time. Exporting upstream `60b66888a1a3`, applying patch **0001**
+with `--fuzz=0`, and comparing file paths and bytes against that branch found **all 1,801 files
+under `engine/zig` identical**, with no missing or extra files. Its upstream merge therefore adds
+no runtime changes beyond this stack's existing combination. WebP decoding and streamed Anthropic
+prompt-token accounting are already included. Local patches **0002–0007** remain necessary additions;
+switching directly to the branch would discard them.
+
+The new `scripts/zig-stack-slots8.sh` is a site-specific wrapper requiring an untracked
+`config/prod-zig-slots8.env` and a fixed image tag. It is not a portable eight-slot recipe or evidence
+that eight slots fit this deployment. Keep the four-slot profile; any capacity change requires separate
+preparation and memory/concurrency qualification. Upstream launchers are reference material; this stack
+uses its own head-managed `./stack` lifecycle.
+
+Updated the README's branch link. The source lock intentionally retains the original serving-delta
+commit: changing provenance-only lock fields would change the runtime fingerprint and invalidate
+matching assets without changing runtime code. No build, preparation, service restart, precision change,
+or live benchmark was needed for this review.
 
 ## Runtime patches
 
@@ -53,6 +75,8 @@ tensor hashes. Tensor checksum scans require `verify-weights` or `--verify-weigh
 cached checkpoint files stay unchanged.
 
 ## Build and assets
+
+For staged commands, updates and cache handling, see the [build and preparation guide](BUILD.md).
 
 The upstream-derived Dockerfile targets ARM64/SM121 with Zig 0.17.0, CUDA 13.0.1, and cuBLAS/cuBLASLt 13.6.0.2.
 CUDA base tags and other APT packages are not fully pinned, so independent rebuilds are not bit-reproducible.
