@@ -1,4 +1,26 @@
-# Validation (2026-10-27)
+# Validation (2026-10-30)
+
+## Upstream runtime update (2026-10-30)
+
+Moved the source pin from jayleaton `60b66888a1a3` to upstream `main` `391d677b30` and reassembled sources.
+The engine base remains TensorFold 1.0.2 / DeepSeek-V4.1 export `9131e10a`. The update includes the
+4K-prefill index-buffer fix (#78) and the optional STREAM_RB=4 tooling (not enabled by any recipe); the
+upstream guard/watchdog layer is not adopted and no recipe, model, KV/index precision or serving setting
+was changed.
+
+- `./stack fetch`: patches 0001–0007 applied with `--fuzz=0`; repeat fetch reported matching exports.
+  New runtime `8938cc1d2b7c56a7`, source hash
+  `8bfddddb470a5355154c43005580e30f243523d78d3e8f5ae26ccada0cfec6cf`; the previous export is retained at
+  `.stack/source.previous`.
+- `./scripts/test.sh`: 97 tests passed, with shell syntax checks and the isolated baseline dry-run.
+- `./stack test-runtime` was **not** run: the development host has no Docker. On spark01 the live head
+  (`spark-tf-3d9d047c-r0`, image `f1cc36f6556d`, runtime `efbc1a1b9c78642d`, checkout `68095ff`) was serving
+  with about 5 GiB available, so building a temporary test image beside it was not attempted. Both Spark
+  checkouts still pin `60b66888`; deployment requires `./stack fetch`, `build`, `prepare` and `start` in a
+  maintenance window.
+
+These checks are source assembly and orchestration validation only. They do not establish GPU kernel
+correctness, memory fit, maximum context, modalities or performance.
 
 ## Prepared-weight reuse and startup (2026-10-27)
 

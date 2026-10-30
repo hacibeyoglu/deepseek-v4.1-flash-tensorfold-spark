@@ -1,13 +1,13 @@
 # Source provenance
 
 Code and checkpoint metadata checked on 2026-10-26; `main-0rand` runtime equivalence rechecked on
-2026-10-27 (details below). Full pins are in [sources.lock.json](../sources.lock.json)
-and [recipes/flash17-jay-exl3-2.8bpw.json](../recipes/flash17-jay-exl3-2.8bpw.json).
+2026-10-27; the runtime/tooling base moved to upstream `391d677b` on 2026-10-30 (details below). Full pins are in
+[sources.lock.json](../sources.lock.json) and [recipes/flash17-jay-exl3-2.8bpw.json](../recipes/flash17-jay-exl3-2.8bpw.json).
 Serving defaults, source-to-runtime mappings and deliberate differences are in [recipe settings](RECIPE-SETTINGS.md).
 
 | Component | Source |
 |---|---|
-| Runtime/tooling base | [jayleaton `60b66888a1a3`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/60b66888a1a379fb38bf85c232b27ec60b007373) |
+| Runtime/tooling base | [jayleaton `391d677b300d`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/391d677b300d9b53e64f4265a261c0b329ea58e0) |
 | Serving changes | [0rand `305659970ae6`](https://github.com/0rand/deepseek-v41-tensorfold-spark/commit/305659970ae63729b0753b27dea85a7ac4b5a93b), `pr65-flash17-serving` |
 | Common ancestor | `853310dab967480013eda7cef4e79c2fd041629a` |
 | Asset Python reference | [ashhart/TensorFold `c4646171139e`](https://github.com/ashhart/TensorFold/commit/c4646171139ee8a3c38103eaa1699dad226ec12b), plus the base repository's three Python patches |
@@ -15,6 +15,30 @@ Serving defaults, source-to-runtime mappings and deliberate differences are in [
 | Engram source | [DeepSeek original, revision `1bae0e108899`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/tree/1bae0e1088993b9b82de08f59de5be5a34e42170) |
 | Experimental EAQ v1 checkpoint | [Mia EXL3 2.9 bpw, revision `45ee5d0fd106`](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw/tree/45ee5d0fd106c94a3d77f721e09cbb2f50e5a16b) |
 | Experimental LibertAI checkpoint | [LibertAI EXL3 2.9 bpw, revision `afc7aa0aab98`](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw/tree/afc7aa0aab98ee735c0f54e0a122019af1ac08f1) |
+
+## Upstream update, 2026-10-30
+
+Moved the runtime/tooling pin from jayleaton `60b66888a1a3` to upstream `main` `391d677b30` (2026-10-30),
+seven commits and 107 paths later. The vendored engine is still TensorFold 1.0.2 (`f8fe17d2`) plus the
+DeepSeek-V4.1 export `9131e10a`.
+
+- `33cb5e8` (#78) bounds index position and scratch allocations for intermediate prompt positions and
+  ragged segments during 4K prefill, with an 88-case regression. This is the only engine-code change that
+  affects this stack; it is included in the assembled export.
+- `391d677` (#71) adds the optional STREAM_RB=4 Triton path and its FP64 score gate. The recipe does not
+  set `TF_DSV41_STREAM_RB`, so serving behavior is unchanged; enabling it would require regenerated AOT
+  variants and separate TP=2 validation.
+- `fc9da83`, `3968f6b`, `649f73c` and the merge commits add upstream's guard/watchdog subsystem,
+  systemd units and documentation. This stack does not import that orchestration layer: `./stack`
+  remains the lifecycle, the engine still serves on `PORT=8000`, `TF_DSV41_PLAN_PIN` stays `auto`,
+  `TF_DSV41_PF_WS_FLOOR_GIB` stays 3.5 GiB, and no host CPU set or `TF_CUDA_SCHED` is imposed.
+
+The export was assembled with `./stack fetch`; patches **0001–0007** applied with `--fuzz=0` (two files kept
+GNU patch `.orig` backups after hunks applied at offsets). Repeat fetch reported the pinned
+exports already match. Runtime host tests were not run for this update: the development host has no Docker,
+and the live head had only about 5 GiB available. Local orchestration suite: 97 tests passed, shell syntax
+and the isolated baseline dry-run passed. Runtime identity became `8938cc1d2b7c56a7`; assembled source hash
+`8bfddddb470a5355154c43005580e30f243523d78d3e8f5ae26ccada0cfec6cf`.
 
 ## main-0rand review, 2026-10-27
 

@@ -2,7 +2,7 @@
   "schema": 1,
   "upstream": {
     "url": "https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git",
-    "commit": "60b66888a1a379fb38bf85c232b27ec60b007373"
+    "commit": "391d677b300d9b53e64f4265a261c0b329ea58e0"
   },
   "fork": {
     "url": "https://github.com/0rand/deepseek-v41-tensorfold-spark.git",
