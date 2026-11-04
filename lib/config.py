@@ -11,6 +11,28 @@ import re
 import copy
 
 RUNTIME_IMAGE = "spark-ds41-tensorfold:latest"
+ENGINE_PREFIXES = ("TF_DSV41_", "TF_TP_", "TENSORFOLD_")
+ENGINE_EXACT = {"TF_DRAIN_S", "TF_SSE_KEEPALIVE_S", "TF_CUDA_SCHED"}
+LAUNCHER_ONLY = {"TF_DSV41_THINKING", "TF_DSV41_DEFAULT_EFFORT"}
+LAUNCHER_MANAGED = {
+    "TF_TP_WORLD", "TF_TP_RANK", "TF_TP_DEVICE", "TF_TP_MASTER", "TF_TP_PORT",
+    "TF_COMM_BACKEND", "TF_TP_ROCE_HCA", "TF_TP_ROCE_HCAS", "NCCL_SOCKET_IFNAME", "NCCL_IB_HCA",
+    "NCCL_CUMEM_ENABLE", "NCCL_CUMEM_HOST_ENABLE", "TF_EXPERIMENTAL", "TF_TP_KERNEL_IMAGE",
+}
+LEGACY_ENV = {
+    "TF_DSV41_INDEX_KV": "the pinned engine no longer reads an index-KV precision switch",
+    "TF_DSV41_PLAN_TIMEOUT": "use TF_TP_PLAN_TIMEOUT",
+    "TF_DSV41_PLAN_LINK": "use TF_TP_PLAN_LINK",
+    "TF_DSV41_PLAN_PIN": "use TF_TP_PLAN_PIN",
+    "TF_DSV41_REQUEST_LOG": "use TENSORFOLD_REQUEST_LOG",
+    "TF_DSV41_SSE_KEEPALIVE_S": "use TF_SSE_KEEPALIVE_S",
+    "TF_DSV41_TOOL_GRAMMAR": "use TENSORFOLD_TOOL_GRAMMAR",
+    "TF_DSV41_DISCONNECT": "removed; TF_DRAIN_S bounds in-flight requests",
+    "TF_DSV41_SESSION_DISK_WRITE_THROUGH": "removed; the pinned engine writes completed entries through",
+    "TF_DSV41_NEEDS_MODEL": "the pinned engine plans widths from the pack itself",
+    "GLM53_TF_ROCE_MAX_KB": "use TF_TP_MAILBOX_MAX_KB",
+    "GLM53_TF_ROCE_FAST": "use TF_TP_ROCE_FAST",
+}
 
 
 class StackError(RuntimeError):
@@ -87,9 +109,13 @@ def validate_recipe(recipe):
                 raise StackError(f"serve.{key} must be a finite number in {'(' if key == 'top_p' else '['}{low}, {high}]")
     if "top_k" in s and (type(s["top_k"]) is not int or not 0 <= s["top_k"] <= 4294967295):
         raise StackError("serve.top_k must be an integer in [0, 4294967295]")
-    owned = {"TF_DSV41_CONTEXT", "TF_DSV41_SLOTS", "TF_DSV41_DRAIN_S"}
+    owned = {"TF_DSV41_CONTEXT", "TF_DSV41_SLOTS", "TF_DRAIN_S"}
     for key, val in recipe["env"].items():
-        if key in owned or not re.fullmatch(r"(?:TF_DSV41_|GLM53_TF_)[A-Z0-9_]+", key):
+        if key in owned or key in LAUNCHER_MANAGED:
+            raise StackError(f"Managed environment key cannot be set by a recipe: {key}")
+        if key in LEGACY_ENV:
+            raise StackError(f"Unsupported environment key {key}: {LEGACY_ENV[key]}")
+        if key not in LAUNCHER_ONLY and key not in ENGINE_EXACT and not key.startswith(ENGINE_PREFIXES):
             raise StackError(f"Unsupported/managed environment key: {key}")
         if not isinstance(val, str) or any(c in val for c in "\n\r\x00"):
             raise StackError(f"Environment value {key} must be a single-line string")
@@ -184,13 +210,17 @@ def synthetic_cluster(root, nodes):
 
 def effective_env(recipe, cluster, rank):
     env = dict(recipe["env"])
+    env.pop("TF_DSV41_THINKING", None)
+    env.pop("TF_DSV41_DEFAULT_EFFORT", None)
     s, net = recipe["serve"], cluster["network"]
     env.update(TF_DSV41_CONTEXT=str(s["context"]), TF_DSV41_SLOTS=str(s["slots"]),
-               TF_DSV41_DRAIN_S=str(s["drain_seconds"]), TF_TP_WORLD="2", TF_TP_RANK=str(rank),
+               TF_DRAIN_S=str(s["drain_seconds"]), TF_TP_WORLD="2", TF_TP_RANK=str(rank),
                TF_TP_DEVICE="0", TF_TP_MASTER=net["master"], TF_TP_PORT=str(net["port"]),
                TF_COMM_BACKEND="roce", TF_TP_ROCE_HCA=net["nodes"][rank]["hcas"],
                TF_TP_ROCE_HCAS=str(len(net["nodes"][rank]["hcas"].split(","))),
-               NCCL_SOCKET_IFNAME=net["nodes"][rank]["nic"], NCCL_IB_HCA=net["nodes"][rank]["nccl_hcas"])
+               NCCL_SOCKET_IFNAME=net["nodes"][rank]["nic"], NCCL_IB_HCA=net["nodes"][rank]["nccl_hcas"],
+               TF_EXPERIMENTAL="deepseek", NCCL_CUMEM_ENABLE="0", NCCL_CUMEM_HOST_ENABLE="0")
+    env.setdefault("TF_TP_KERNEL_IMAGE", "/opt/tensorfold/share/tp_mailbox.fatbin")
     return env
 
 
@@ -241,9 +271,11 @@ def plan(root, recipe, cluster):
             for key in ("temperature", "top_p", "top_k"):
                 if key in s:
                     args += ["--" + key.replace("_", "-"), str(s[key])]
-            if env.get("TF_DSV41_THINKING") == "0": args.append("--no-thinking")
-            if env.get("TF_DSV41_DRAFTS", "0") == "0": args.append("--no-drafts")
+            if recipe["env"].get("TF_DSV41_THINKING") == "0": args.append("--no-thinking")
+            effort = recipe["env"].get("TF_DSV41_DEFAULT_EFFORT")
+            if effort: args += ["--reasoning-effort", effort]
+            if recipe["env"].get("TF_DSV41_DRAFTS", "0") == "0": args.append("--no-drafts")
         else:
-            args += ["tf-dsv41-m1", "follow", model, "/assets"]
+            args += ["tf-dsv41", "follow", model, "/assets"]
         result["nodes"].append({**node, "name": name, "env": env, "paths": paths, "command": args})
     return result

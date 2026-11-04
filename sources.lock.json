@@ -1,19 +1,23 @@
 {
   "schema": 1,
+  "engine": {
+    "url": "https://github.com/jayleaton/TensorFold.git",
+    "commit": "58bece1d3184269059fd3f7f755c52f4f295113d",
+    "branch": "dsv41/candidate-g",
+    "base_upstream": "v1.1.8",
+    "fallback_commit": "56200688d52af54062fadbab12de36e95165ad72"
+  },
   "upstream": {
     "url": "https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git",
-    "commit": "391d677b300d9b53e64f4265a261c0b329ea58e0"
-  },
-  "fork": {
-    "url": "https://github.com/0rand/deepseek-v41-tensorfold-spark.git",
-    "commit": "305659970ae63729b0753b27dea85a7ac4b5a93b",
-    "common_base": "853310dab967480013eda7cef4e79c2fd041629a"
+    "commit": "391d677b300d9b53e64f4265a261c0b329ea58e0",
+    "role": "asset-generator reference: engine/zig tools, scripts/pack_engram.py and config/pfdense-table.json"
   },
   "python_reference": {
     "url": "https://github.com/ashhart/TensorFold.git",
     "commit": "c4646171139ee8a3c38103eaa1699dad226ec12b"
   },
-  "patches": [
+  "patches": [],
+  "legacy_patches": [
     "patches/0001-sessions-memory-telemetry.patch",
     "patches/0002-engram-resume-init.patch",
     "patches/0003-direct-io-test-buffered-fd.patch",

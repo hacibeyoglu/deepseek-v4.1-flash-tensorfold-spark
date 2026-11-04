@@ -158,10 +158,12 @@ class ConfigTests(unittest.TestCase):
 
     def test_no_precision_change_or_disabled_memory_guard(self):
         env = self.recipe["env"]
-        self.assertEqual(env["TF_DSV41_INDEX_KV"], "fp8")
+        self.assertNotIn("TF_DSV41_INDEX_KV", env)
+        self.assertNotIn("TF_DSV41_SESSION_DISK_WRITE_THROUGH", env)
         self.assertEqual(env["TF_DSV41_BOOT_MEASURED"], "auto")
         self.assertEqual(env["TF_DSV41_FLOOR_HARD_GIB"], "4")
-        self.assertEqual(env["TF_DSV41_SESSION_DISK_WRITE_THROUGH"], "1")
+        self.assertEqual(env["TF_TP_PLAN_TIMEOUT"], "1800")
+        self.assertEqual(env["TF_DSV41_PF_WS_FLOOR_GIB"], "4.75")
 
     def test_validation_rejects_unpinned_checkpoint(self):
         self.recipe["model"]["revision"] = "main"
@@ -489,7 +491,7 @@ class SourceTests(unittest.TestCase):
             (root / "docker/Dockerfile").write_text("FROM example\n")
             (root / "patches/change.patch").write_text(
                 "diff --git a/engine/file b/engine/file\n--- a/engine/file\n+++ b/engine/file\n@@ -1 +1 @@\n-old\n+combined\n")
-            (root / "sources.lock.json").write_text(json.dumps({"upstream": {}, "python_reference": {}, "patches": ["patches/change.patch"]}))
+            (root / "sources.lock.json").write_text(json.dumps({"engine": {}, "upstream": {}, "python_reference": {}, "patches": ["patches/change.patch"]}))
             def fake_export(root, spec, destination, cache=None):
                 destination.mkdir()
                 if destination.name == "source":

@@ -38,6 +38,7 @@ def parser():
         if name == "fetch":
             sub.add_argument("--source-cache", type=Path, help="Use an existing Git repo containing the pinned upstream commit")
             sub.add_argument("--python-cache", type=Path, help="Use an existing Git repo containing the pinned Python reference")
+            sub.add_argument("--engine-cache", type=Path, help="Use an existing Git repo containing the pinned TensorFold engine commit")
         if name == "logs":
             sub.add_argument("--rank", choices=("0", "1", "both"), default="both")
             sub.add_argument("--tail", type=int, default=100)
@@ -137,7 +138,7 @@ def main(argv=None):
         with locked(): setup(ROOT, args.worker, args.worker_dir, args.config)
         return 0
     if args.action == "fetch":
-        with locked(): sources.fetch(ROOT, args.source_cache, args.python_cache)
+        with locked(): sources.fetch(ROOT, args.source_cache, args.python_cache, args.engine_cache)
         return 0
     if args.action == "test-runtime":
         with locked(), runtime_builder(args.builder_image) as image:

@@ -227,8 +227,9 @@ class Cluster:
         if current is None or current["labels"].get("io.spark-tensorfold.runtime") != rid:
             context = sources.build_context(self.root)
             dockerfile = str(self.root / "docker/Dockerfile")
+            engine_rev = self.lock["engine"]["commit"]
             common = ["docker", "build", "--progress=plain", "-f", dockerfile,
-                      "--build-arg", f"ZIG_COMMIT={rid}", "--label", f"io.spark-tensorfold.runtime={rid}"]
+                      "--build-arg", f"TENSORFOLD_REV={engine_rev}", "--label", f"io.spark-tensorfold.runtime={rid}"]
             sources.run([*common, "-t", image, str(context)])
         else:
             print("Runtime fingerprint matches; skipping Docker build.", flush=True)

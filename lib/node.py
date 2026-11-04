@@ -11,6 +11,7 @@ import pwd
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -120,7 +121,7 @@ def make_paths(node):
     (Path(node["paths"]["state"]) / "sessions").mkdir(exist_ok=True)
 
 
-def docker_base(node, image, env=None, *, tools=False):
+def docker_base(node, image, env=None, *, tools=False, entrypoint=None):
     args = ["docker", "run", "--rm", "--init", "--pull=never", "--network", "none",
             "--user", f"{node['uid']}:{node['gid']}", "--env", "HOME=/tmp",
             "--env", "NVIDIA_VISIBLE_DEVICES=void",
@@ -134,7 +135,7 @@ def docker_base(node, image, env=None, *, tools=False):
     for src, dst, ro in mounts:
         args += ["--mount", f"type=bind,src={src},dst={dst}" + (",readonly" if ro else "")]
     for key, value in sorted((env or node["env"]).items()): args += ["--env", f"{key}={value}"]
-    return args + ["--entrypoint", "python" if tools else "tf-dsv41-m1", image]
+    return args + ["--entrypoint", entrypoint or ("python" if tools else "tf-dsv41"), image]
 
 
 def download(request):
@@ -159,7 +160,7 @@ def download(request):
     return verified
 
 
-SHARED_ASSETS = ("sigs.json", "needs.json", "checked-needs.json", "rope.bin", "engram-host.bin", "aot/aot.json")
+SHARED_ASSETS = ("sigs.json", "needs.json", "rope.bin", "engram-token-map.bin", "engram-token-map.bin.json", "aot/aot.json")
 
 
 def asset_hash(path):
@@ -179,6 +180,42 @@ def shared_hashes(assets):
             raise RuntimeError("Invalid AOT cubin hash")
         names.append(f"aot/cubins/{value}.cubin")
     return {name: asset_hash(assets / name) for name in sorted(set(names))}
+
+
+def _specialization(kernel, compiled):
+    if compiled:
+        consts = kernel["consts"]
+        params = [(p["name"], p["type"], p.get("div16", False)) for p in kernel["params"]]
+    else:
+        consts = {}
+        for key, value in kernel["consts"].items():
+            if isinstance(value, (int, bool)):
+                consts[key] = {"int": int(value)}
+            elif isinstance(value, dict) and "fp64_bits" in value:
+                number = struct.unpack("<d", int(value["fp64_bits"], 16).to_bytes(8, "little"))[0]
+                consts[key] = {"f32": struct.unpack("<I", struct.pack("<f", number))[0]}
+            elif value is not None:
+                raise RuntimeError("Unsupported AOT constant")
+        params = [(key, value["type"], value.get("div16", False)) for key, value in kernel["runtime"].items()]
+    return json.dumps([kernel["fn"], consts, sorted(params)], sort_keys=True)
+
+
+def check_aot_coverage(needs_path, aot):
+    kernels = json.loads((aot / "aot.json").read_text())["kernels"]
+    if not kernels:
+        raise RuntimeError("AOT manifest is empty")
+    for kernel in kernels:
+        key = kernel["hash"]
+        if not re.fullmatch("[A-Za-z0-9_-]+", key):
+            raise RuntimeError("Unsafe AOT cubin key")
+        with (aot / "cubins" / (key + ".cubin")).open("rb") as stream:
+            if stream.read(4) != b"\x7fELF":
+                raise RuntimeError("Missing or invalid ELF cubin: " + key)
+    wanted = json.loads(Path(needs_path).read_text())["kernels"]
+    have = {_specialization(k, True) for k in kernels}
+    missing = [k["fn"] for k in wanted if _specialization(k, False) not in have]
+    if not wanted or missing:
+        raise RuntimeError(f"AOT plan empty or missing variants: {sorted(set(missing))}")
 
 
 def verify_shared(assets, shared, request):
@@ -234,6 +271,9 @@ def prepare(request):
             if asset_hash(assets / name) != expected:
                 raise RuntimeError(f"Cached head asset changed: {name}; restore or regenerate these assets")
     if node["rank"] == 0 and not complete:
+        run(docker_base(node, image, entrypoint="tf-dsv41-token-map") +
+            ["--tokenizer", model + "/tokenizer.json", "--config", model + "/config.json",
+             "--output", "/assets/engram-token-map.bin"])
         run(tool + [prefix + "triton_fill.py", "sigs", "--py", py, "--out", "/assets/sigs.json"])
         run(docker_base(node, image) + ["aot-needs", "/assets/sigs.json", "/assets/needs.json"])
         fill = [prefix + "triton_fill.py", "compile", "--py", py, "--needs", "/assets/needs.json",
@@ -242,11 +282,9 @@ def prepare(request):
         run(tool + fill)
         run(tool + [prefix + "dsv41_rope_tables.py", "--config", model + "/config.json",
                     "--rows", str(recipe["serve"]["context"] + 2048), "--out", "/assets/rope.bin"])
-        run(tool + [prefix + "dsv41_engram_host.py", "--py-src", py, "--config", model + "/config.json",
-                    "--tokenizer", model + "/tokenizer.json", "--out", "/assets/engram-host.bin"])
     shutil.copyfile(Path(node["root"]) / ".stack/source/config/pfdense-table.json", Path(node["paths"]["cache"]) / "pfdense-table.json")
     if node["rank"] == 0:
-        run(docker_base(node, image) + ["aot-needs", "/assets/sigs.json", "/assets/checked-needs.json", "/assets/aot"])
+        check_aot_coverage(assets / "needs.json", assets / "aot")
         hashes = shared_hashes(assets)
         shared = {"identity": {"runtime": request["runtime"], "asset_key": request["asset_key"]}, "hashes": hashes}
     else:

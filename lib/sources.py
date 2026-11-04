@@ -48,24 +48,31 @@ def export(root, spec, destination, cache=None):
         tf.extractall(destination, filter="data")
 
 
-def fetch(root, upstream_cache=None, python_cache=None):
+def fetch(root, upstream_cache=None, python_cache=None, engine_cache=None):
     root = Path(root)
     lock = read_json(root / "sources.lock.json")
     manifest = root / ".stack/source.json"
     rid = runtime_id(root)
-    if manifest.exists():
-        old = read_json(manifest)
-        for name in ("source", "python-source"):
-            if tree_hash(root / ".stack" / name) != old["hashes"][name]:
-                raise StackError(f"Managed {name} has local changes; preserve them before fetching again")
-        if old["runtime"] == rid:
-            print("Pinned runtime and Python reference exports already match.")
+    names = ("engine", "source", "python-source")
+    old = read_json(manifest) if manifest.exists() else {}
+    if old:
+        for name in names:
+            expected = old.get("hashes", {}).get(name)
+            if expected is not None and (root / ".stack" / name).exists():
+                if tree_hash(root / ".stack" / name) != expected:
+                    raise StackError(f"Managed {name} has local changes; preserve them before fetching again")
+        if old.get("runtime") == rid:
+            print("Pinned runtime and reference exports already match.")
             return
-    for name in ("source", "python-source"):
-        if (root / ".stack" / name).exists() and not manifest.exists():
-            raise StackError(f"Unrecognized .stack/{name}; refusing to overwrite it")
+    for name in names:
+        dest = root / ".stack" / name
+        if dest.exists() and name not in old.get("hashes", {}):
+            previous = dest.with_name(name + ".previous")
+            if previous.exists(): shutil.rmtree(previous)
+            dest.rename(previous)
     with tempfile.TemporaryDirectory(prefix="fetch-", dir=root / ".stack") as tmp:
         tmp = Path(tmp)
+        export(root, lock["engine"], tmp / "engine", engine_cache)
         export(root, lock["upstream"], tmp / "source", upstream_cache)
         for name in lock["patches"]:
             # Export directories may sit inside the orchestration repository. patch does not discover a parent .git.
@@ -74,8 +81,8 @@ def fetch(root, upstream_cache=None, python_cache=None):
         export(root, lock["python_reference"], tmp / "python-source", python_cache)
         for patch in sorted((tmp / "source/patches").glob("*.patch")):
             run(["patch", "--batch", "-p1", "-i", str(patch)], cwd=tmp / "python-source")
-        hashes = {name: tree_hash(tmp / name) for name in ("source", "python-source")}
-        for name in hashes:
+        hashes = {name: tree_hash(tmp / name) for name in names}
+        for name in names:
             dest = root / ".stack" / name
             if dest.exists():
                 previous = dest.with_name(name + ".previous")
@@ -101,7 +108,6 @@ def build_context(root):
     context.mkdir(exist_ok=True)
     src = context / "src"
     if src.exists(): shutil.rmtree(src)
-    shutil.copytree(root / ".stack/source/engine/zig", src,
-                    ignore=shutil.ignore_patterns(".zig-cache", "zig-out", "__pycache__"))
-    (context / "fatbins").mkdir(exist_ok=True)
+    shutil.copytree(root / ".stack/engine", src,
+                    ignore=shutil.ignore_patterns(".git", ".zig-cache", "zig-out", "__pycache__"))
     return context
