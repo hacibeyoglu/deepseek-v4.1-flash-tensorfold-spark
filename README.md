@@ -62,6 +62,12 @@ Portable model settings live in [recipes](recipes); local paths and topology liv
 live in ignored `.stack/`. Downloads check file sizes by default; use `./stack verify-weights`
 for explicit checksum verification.
 
+`./stack fetch` applies the seven runtime patches in [patches](patches) to the exported upstream tree, then
+applies the three Python patches for the TensorFold reference. Upstream removed those three from its own
+tree, so they are read from the commit recorded under `python_patches` in
+[sources.lock.json](sources.lock.json) and each file is checked against its SHA-256 before it is applied.
+See [source provenance](docs/SOURCES.md).
+
 The default profile uses four slots, 1,048,576 context per request, a shared 2.1M-token KV pool,
 FP8 index KV, DSpark, native images and SSD session reuse. These are configured capacities;
 see [validation limits](docs/VALIDATION.md) for tested workloads.

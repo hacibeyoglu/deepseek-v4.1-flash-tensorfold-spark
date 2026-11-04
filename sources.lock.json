@@ -2,7 +2,7 @@
   "schema": 1,
   "upstream": {
     "url": "https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git",
-    "commit": "391d677b300d9b53e64f4265a261c0b329ea58e0"
+    "commit": "ed96ef610693ff68ac5b1bec5881de72854554bd"
   },
   "fork": {
     "url": "https://github.com/0rand/deepseek-v41-tensorfold-spark.git",
@@ -12,6 +12,16 @@
   "python_reference": {
     "url": "https://github.com/ashhart/TensorFold.git",
     "commit": "c4646171139ee8a3c38103eaa1699dad226ec12b"
+  },
+  "python_patches": {
+    "url": "https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git",
+    "commit": "391d677b300d9b53e64f4265a261c0b329ea58e0",
+    "path": "patches",
+    "files": {
+      "0001-spark-stack-060.patch": "e6d83093bd29fb41d406487ce4abe48a0c0a9bee23998fd4758b195d4c9ce625",
+      "0002-deepseek-v41-family.patch": "f03c5095e529d88ac778caba79d8f6d396ed4ad76c744469fc7940643059088d",
+      "0003-dsv41-literal-added-tokens.patch": "76f147c74337aab4e419753842b7116d7040d958ade733972dace4dc4b69e553"
+    }
   },
   "patches": [
     "patches/0001-sessions-memory-telemetry.patch",
