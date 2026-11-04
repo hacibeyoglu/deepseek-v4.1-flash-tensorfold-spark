@@ -1,6 +1,21 @@
-# Validation (2026-10-30)
+# Validation (2026-11-04)
 
-## Upstream runtime update (2026-10-30)
+## Reverted to `60b66888a1a3` (2026-11-04)
+
+Live serving on the 2026-10-30 and 2026-11-03 pins was much slower than the previous state, so both bumps
+were reverted. The lock, `lib/sources.py` and the source tests are restored to their `68095ff` contents and
+the runtime identity is again `efbc1a1b9c78642d`, so the existing image and prepared assets are reused
+without a rebuild or a new asset namespace.
+
+- `./stack fetch`: patches 0001–0007 applied with `--fuzz=0`; the three Python patches come from the
+  exported tree's own `patches/` directory, which exists at this pin.
+- `./scripts/test.sh`: 99 tests passed, with shell syntax checks and the isolated baseline dry-run.
+- The slowdown is **not attributed**. The most likely candidate is #78's `planIndexScratch`, which adds
+  `ix.pos*` roles to the buffer plan and can enlarge the planned workspace enough to fall back from 4K to
+  2K prefill segments. That is a reading of the diff, not a measurement.
+- No performance measurement was taken of the reverted state; it restores source identity only.
+
+## Upstream runtime update (2026-10-30, reverted 2026-11-04)
 
 Moved the source pin from jayleaton `60b66888a1a3` to upstream `main` `391d677b30` and reassembled sources.
 The engine base remains TensorFold 1.0.2 / DeepSeek-V4.1 export `9131e10a`. The update includes the

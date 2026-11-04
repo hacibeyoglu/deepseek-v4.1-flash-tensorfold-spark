@@ -495,77 +495,19 @@ class SourceTests(unittest.TestCase):
                 if destination.name == "source":
                     (destination / "engine").mkdir()
                     (destination / "engine/file").write_text("old\n")
+                    (destination / "patches").mkdir()
                 else: (destination / "reference.py").write_text("pass\n")
-            def fake_patches(root, lock, destination, cache=None):
-                destination.mkdir(parents=True)
-                (destination / "reference.patch").write_text(
-                    "diff --git a/reference.py b/reference.py\n--- a/reference.py\n+++ b/reference.py\n@@ -1 +1 @@\n-pass\n+patched\n")
-                return destination
             def quiet_run(args, **kwargs):
                 subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
-            with patch("lib.sources.export", side_effect=fake_export), patch("lib.sources.python_patches", side_effect=fake_patches), patch("lib.sources.run", side_effect=quiet_run):
+            with patch("lib.sources.export", side_effect=fake_export), patch("lib.sources.run", side_effect=quiet_run):
                 sources.fetch(root)
                 self.assertEqual((root / ".stack/source/engine/file").read_text(), "combined\n")
-                self.assertEqual((root / ".stack/python-source/reference.py").read_text(), "patched\n")
                 sources.verify(root)
                 with patch("lib.sources.export", side_effect=AssertionError("unexpected refetch")):
                     sources.fetch(root)
                 (root / ".stack/source/engine/file").write_text("user edit\n")
                 with self.assertRaisesRegex(StackError, "local changes"): sources.fetch(root)
                 self.assertEqual((root / ".stack/source/engine/file").read_text(), "user edit\n")
-
-    def test_python_patches_reject_a_changed_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            git = root / "cache"
-            git.mkdir()
-            subprocess.run(["git", "init", "--quiet", str(git)], check=True)
-            (git / "one.patch").write_text("first\n")
-            subprocess.run(["git", "-C", str(git), "add", "one.patch"], check=True)
-            subprocess.run(["git", "-C", str(git), "-c", "user.name=t", "-c", "user.email=t@t",
-                            "commit", "--quiet", "-m", "fixture"], check=True)
-            commit = subprocess.check_output(["git", "-C", str(git), "rev-parse", "HEAD"], text=True).strip()
-            good = hashlib.sha256(b"first\n").hexdigest()
-            lock = {"python_patches": {"url": "unused", "commit": commit, "path": "",
-                                       "files": {"one.patch": good}}}
-            destination = root / "out"
-            sources.python_patches(root, lock, destination, cache=git)
-            self.assertEqual((destination / "one.patch").read_text(), "first\n")
-            lock["python_patches"]["files"]["one.patch"] = "0" * 64
-            with self.assertRaisesRegex(StackError, "changed"):
-                sources.python_patches(root, lock, root / "out2", cache=git)
-
-    def test_python_patches_ignore_a_cache_without_the_pinned_commit(self):
-        """--python-cache holds the TensorFold reference, which never carries the recipe patches."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            reference = root / "reference"
-            reference.mkdir()
-            subprocess.run(["git", "init", "--quiet", str(reference)], check=True)
-            (reference / "unrelated.txt").write_text("x\n")
-            subprocess.run(["git", "-C", str(reference), "add", "unrelated.txt"], check=True)
-            subprocess.run(["git", "-C", str(reference), "-c", "user.name=t", "-c", "user.email=t@t",
-                            "commit", "--quiet", "-m", "fixture"], check=True)
-            lock = {"python_patches": {"url": "unused", "commit": "0" * 40, "path": "patches", "files": {}}}
-            seen = []
-            def record(args, **kwargs):
-                seen.append(args)
-                raise subprocess.CalledProcessError(128, args)
-            with patch("lib.sources.run", side_effect=record):
-                with self.assertRaises(subprocess.CalledProcessError):
-                    sources.python_patches(root, lock, root / "out", cache=reference)
-            # It must not read the foreign cache; it initializes its own and fetches the pin there.
-            self.assertTrue(seen)
-            self.assertIn(str(root / ".stack/git" / ("0" * 40)), seen[0])
-            self.assertNotIn(str(reference), " ".join(seen[0]))
-
-    def test_python_patches_do_not_read_the_export(self):
-        """Upstream removed patches/; a missing directory must not silently apply nothing."""
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "source").mkdir()
-            self.assertEqual(sorted((root / "source/patches").glob("*.patch")), [])
-            self.assertFalse((root / "source/patches").exists())
 
     def test_runtime_id_tracks_patch_changes(self):
         from lib.config import runtime_id

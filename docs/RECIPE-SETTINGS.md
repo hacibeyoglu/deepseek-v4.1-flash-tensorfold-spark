@@ -1,8 +1,7 @@
 # Recipe settings and their origins
 
-Reviewed 2026-10-26 against the then-pinned launchers and engine readers; the links below now track the
-2026-11-03 source pin. These are translations into this repository's combined Zig runtime, not copies of
-another engine's environment.
+Reviewed 2026-10-26 against the pinned launchers and engine readers linked below. These are translations
+into this repository's combined Zig runtime, not copies of another engine's environment.
 Mia's experimental 2.9 bpw profile remains unqualified on GPU. LibertAI's reduced-context profile passed the limited
 live checks described in [validation](VALIDATION.md); it is not maximum-context or performance qualification.
 
@@ -24,7 +23,7 @@ live checks described in [validation](VALIDATION.md); it is not maximum-context 
 | Minimum tokens for SSD entry | 1024 | Not applicable | 4096 |
 
 `serve.slots` becomes `TF_DSV41_SLOTS` on both ranks and `--parallel` on the head. The runtime's
-[slot reader](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/blob/ed96ef610693ff68ac5b1bec5881de72854554bd/engine/zig/zig/src/families/deepseek_v41/slots.zig)
+[slot reader](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/blob/60b66888a1a379fb38bf85c232b27ec60b007373/engine/zig/zig/src/families/deepseek_v41/slots.zig)
 accepts 1–16; this launcher exposes 1–8 to cover the selected source profiles. Supporting eight in command
 generation does not establish eight-request memory fit or throughput.
 
@@ -41,24 +40,11 @@ they do not change kernel assets. Slot and environment changes select fresh asse
 
 ### Jayleaton
 
-Source: [flash17 environment](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/blob/ed96ef610693ff68ac5b1bec5881de72854554bd/config/prod-zig-flash17.env.example)
-at `ed96ef610693ff68ac5b1bec5881de72854554bd`, the runtime/tooling base in `sources.lock.json`.
-Its inference environment is retained except for the guard-era settings: the newer source profile runs the
-engine on port 8001 behind upstream's guard with `TF_DSV41_PLAN_PIN=1`, a host `CPUSET_CPUS`,
-`TF_CUDA_SCHED=blocking` and a 4.75 GiB workspace floor. This stack does not run that guard, so the recipe
-keeps port 8000, `PLAN_PIN=auto`, no CPU set or CUDA scheduling override and the 3.5 GiB workspace floor.
-SSD capacity and minimum entry length now match its 128 GiB / 1024
+Source: [flash17 environment](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/blob/60b66888a1a379fb38bf85c232b27ec60b007373/config/prod-zig-flash17.env.example)
+at `60b66888a1a379fb38bf85c232b27ec60b007373`, the runtime/tooling base in `sources.lock.json`.
+Its inference environment is retained. SSD capacity and minimum entry length now match its 128 GiB / 1024
 values instead of the local 32 GiB / zero override. The source launcher supplies no sampling overrides;
 the baseline continues to inherit checkpoint/runtime defaults.
-
-That profile now also carries settings for the TensorFold pin upstream builds from `config/tensorfold.rev`
-(`TF_DSV41_COMPUTE_LANE`, `TF_DSV41_KV_MIRROR`, `TF_DSV41_ROT_FOLD`, `TF_DSV41_IDX_SPLIT`,
-`TF_DSV41_NO_COPIES`, `TF_DSV41_IDX_IOTA`, `TF_DSV41_ENGRAM_VALIDATE`, `TF_DSV41_PF_SCRATCH_ALIAS`,
-`TF_DSV41_TOKENIZER_MESSAGE_MEMO`, `TF_DSV41_DEPTH_OVERHEAD_MS`, `TF_CUDA_SCHED`) and the renamed
-`TF_TP_*` / `TF_SSE_KEEPALIVE_S` / `TENSORFOLD_REQUEST_LOG` names. This stack builds the `engine/zig`
-export instead, which reads none of those names, so they are not adopted here. Its own
-`TF_DSV41_PF_WS_FLOOR_GIB` also moved from 3.5 to 4.75; this stack keeps 3.5, which its measured
-boot guard and 4K-to-2K fallback were validated against.
 
 ### Mia EAQ v1
 

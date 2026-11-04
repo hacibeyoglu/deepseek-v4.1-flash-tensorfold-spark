@@ -48,38 +48,6 @@ def export(root, spec, destination, cache=None):
         tf.extractall(destination, filter="data")
 
 
-def python_patches(root, lock, destination, cache=None):
-    """The reference tree's three patches, from the pinned commit that still carries them.
-
-    Upstream removed `patches/` from the recipe tree when the native switch landed, so the
-    patches are read from `python_patches` in the lock instead of the export. Each file is
-    checked against its pinned SHA-256 before it is applied.
-
-    `cache` is a caller-supplied recipe repository. It is used only when it already holds the
-    pinned commit; otherwise the patches come from this stack's own cache, because a shallow
-    upstream cache does not carry the older commit.
-    """
-    spec = lock["python_patches"]
-    def holds(git):
-        return subprocess.run(["git", "-C", str(git), "cat-file", "-e", spec["commit"] + "^{commit}"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    git = Path(cache) if cache and holds(cache) else root / ".stack/git" / spec["commit"]
-    if not holds(git):
-        if not git.exists():
-            git.mkdir(parents=True)
-            run(["git", "init", "--bare", "--initial-branch=main", str(git)])
-        run(["git", "-C", str(git), "fetch", "--depth=1", spec["url"], spec["commit"]])
-    destination.mkdir(parents=True)
-    prefix = spec["path"].strip("/")
-    for name, expected in sorted(spec["files"].items()):
-        blob = subprocess.check_output(["git", "-C", str(git), "show", f'{spec["commit"]}:{prefix + "/" if prefix else ""}{name}'])
-        actual = hashlib.sha256(blob).hexdigest()
-        if actual != expected:
-            raise StackError(f"Pinned Python patch {name} changed: {actual} != {expected}")
-        (destination / name).write_bytes(blob)
-    return destination
-
-
 def fetch(root, upstream_cache=None, python_cache=None):
     root = Path(root)
     lock = read_json(root / "sources.lock.json")
@@ -104,10 +72,7 @@ def fetch(root, upstream_cache=None, python_cache=None):
             run(["patch", "--batch", "--forward", "--fuzz=0", "--dry-run", "-p1", "-i", str(root / name)], cwd=tmp / "source")
             run(["patch", "--batch", "--forward", "--fuzz=0", "-p1", "-i", str(root / name)], cwd=tmp / "source")
         export(root, lock["python_reference"], tmp / "python-source", python_cache)
-        # The patches live in the recipe repository, so --source-cache may hold them; --python-cache
-        # holds the TensorFold reference and never does.
-        patches = python_patches(root, lock, tmp / "python-patches", upstream_cache)
-        for patch in sorted(patches.glob("*.patch")):
+        for patch in sorted((tmp / "source/patches").glob("*.patch")):
             run(["patch", "--batch", "-p1", "-i", str(patch)], cwd=tmp / "python-source")
         hashes = {name: tree_hash(tmp / name) for name in ("source", "python-source")}
         for name in hashes:
