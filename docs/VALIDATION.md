@@ -1,21 +1,34 @@
 # Validation (2026-11-04)
 
-## Reverted to `60b66888a1a3` (2026-11-04)
+## Upstream-current re-test (2026-11-04)
 
-Live serving on the 2026-10-30 and 2026-11-03 pins was much slower than the previous state, so both bumps
-were reverted. The lock, `lib/sources.py` and the source tests are restored to their `68095ff` contents and
-the runtime identity is again `efbc1a1b9c78642d`, so the existing image and prepared assets are reused
-without a rebuild or a new asset namespace.
+The 2026-11-03 pin (`ed96ef610693`) is re-applied for testing after the 2026-11-04 revert. The revert
+followed live serving that was much slower than the previous state; that slowdown was **not attributed**,
+and this re-test exists to establish whether it reproduces and, if so, which change causes it.
 
-- `./stack fetch`: patches 0001–0007 applied with `--fuzz=0`; the three Python patches come from the
-  exported tree's own `patches/` directory, which exists at this pin.
-- `./scripts/test.sh`: 99 tests passed, with shell syntax checks and the isolated baseline dry-run.
-- The slowdown is **not attributed**. The most likely candidate is #78's `planIndexScratch`, which adds
-  `ix.pos*` roles to the buffer plan and can enlarge the planned workspace enough to fall back from 4K to
-  2K prefill segments. That is a reading of the diff, not a measurement.
-- No performance measurement was taken of the reverted state; it restores source identity only.
+Runtime identity is `87425ce1f41f63c9`, so this pin needs its own image build and asset namespace. The
+previous export is retained at `.stack/source.previous`; prepared weight images under
+`.stack/prepared/<model-revision>/` are reused, so this is a rebuild-and-prepare cycle, not a weight
+reconversion.
 
-## Upstream runtime update (2026-10-30, reverted 2026-11-04)
+What differs from the reverted state, and what to watch:
+
+- **#78 `planIndexScratch`** adds `ix.pos*` roles to the buffer plan and enlarges the index roles it
+  finds. A larger planned workspace can push a prompt piece past `TF_DSV41_PF_WS_FLOOR_GIB` and fall
+  back from 4K to 2K prefill segments. This is the leading suspect for the slowdown. Decisive check:
+  whether the slow runs log prefill-workspace fallback warnings, and whether `TF_DSV41_PF_WS_FLOOR_GIB`
+  at 3.5 GiB is now too tight for the larger plan.
+- **#71 `STREAM_RB=4`** is present but should be inert: no recipe sets `TF_DSV41_STREAM_RB`, which
+  defaults to `0`.
+- The `python_patches` reader is restored, because upstream deleted `patches/` in `44b3dcd`. Without it
+  `fetch` would silently apply zero Python patches.
+
+To compare against the reverted baseline, record the same workload on both: model/revision, runtime
+identity, effective settings, prompt and output token counts, concurrency, and cold versus warm cache.
+Separate prefill from decode, since a prefill-segment fallback shows up in prefill time and barely in
+decode. Do not treat a single run as attribution.
+
+## Upstream runtime update (2026-10-30)
 
 Moved the source pin from jayleaton `60b66888a1a3` to upstream `main` `391d677b30` and reassembled sources.
 The engine base remains TensorFold 1.0.2 / DeepSeek-V4.1 export `9131e10a`. The update includes the
