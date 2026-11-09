@@ -1,4 +1,38 @@
-# Validation (2026-10-30)
+# Validation
+
+The dated runtime results below describe earlier export-based builds. The current source lock retains
+the local candidate G migration and merges the remote asset-source/Python-patch updates. The Git merge
+on 2026-11-09 passed all 100 orchestration tests, shell syntax checks and the isolated synthetic-node
+launch dry-run (`./scripts/test.sh`). It did not build, prepare or deploy that runtime; earlier GPU
+results do not qualify it.
+
+## Upstream-current re-test (2026-11-04)
+
+The 2026-11-03 pin (`ed96ef610693`) is re-applied for testing after the 2026-11-04 revert. The revert
+followed live serving that was much slower than the previous state; that slowdown was **not attributed**,
+and this re-test exists to establish whether it reproduces and, if so, which change causes it.
+
+Runtime identity is `87425ce1f41f63c9`, so this pin needs its own image build and asset namespace. The
+previous export is retained at `.stack/source.previous`; prepared weight images under
+`.stack/prepared/<model-revision>/` are reused, so this is a rebuild-and-prepare cycle, not a weight
+reconversion.
+
+What differs from the reverted state, and what to watch:
+
+- **#78 `planIndexScratch`** adds `ix.pos*` roles to the buffer plan and enlarges the index roles it
+  finds. A larger planned workspace can push a prompt piece past `TF_DSV41_PF_WS_FLOOR_GIB` and fall
+  back from 4K to 2K prefill segments. This is the leading suspect for the slowdown. Decisive check:
+  whether the slow runs log prefill-workspace fallback warnings, and whether `TF_DSV41_PF_WS_FLOOR_GIB`
+  at 3.5 GiB is now too tight for the larger plan.
+- **#71 `STREAM_RB=4`** is present but should be inert: no recipe sets `TF_DSV41_STREAM_RB`, which
+  defaults to `0`.
+- The `python_patches` reader is restored, because upstream deleted `patches/` in `44b3dcd`. Without it
+  `fetch` would silently apply zero Python patches.
+
+To compare against the reverted baseline, record the same workload on both: model/revision, runtime
+identity, effective settings, prompt and output token counts, concurrency, and cold versus warm cache.
+Separate prefill from decode, since a prefill-segment fallback shows up in prefill time and barely in
+decode. Do not treat a single run as attribution.
 
 ## Upstream runtime update (2026-10-30)
 

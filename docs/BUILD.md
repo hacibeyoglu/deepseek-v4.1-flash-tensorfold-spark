@@ -39,6 +39,14 @@ With the stack stopped:
 ./stack start
 ```
 
+`./stack fetch` exports the candidate G native engine and the asset-generator references. The seven older
+runtime patches in [patches](../patches) are archived under `legacy_patches` and are not applied.
+The three Python patches for the TensorFold reference are read from the commit recorded
+under `python_patches` in [sources.lock.json](../sources.lock.json), because upstream removed `patches/` from its
+own tree; each file is checked against its pinned SHA-256 before it is applied. A supplied `--source-cache` is
+used for them only when it already holds that commit, and `--python-cache` never is, since it holds the
+TensorFold reference rather than the recipe repository.
+
 Run `./stack test-assets` when validating asset tooling; it requires the preparation image to be available.
 Host tests and isolated dry-runs do not establish GPU correctness, memory fit, maximum context,
 modalities or concurrent performance. See [validation procedures](VALIDATION.md#reproduce).
