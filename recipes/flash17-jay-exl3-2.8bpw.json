@@ -117,6 +117,10 @@
     "TF_DSV41_DEPTH_OVERHEAD_MS": "0",
     "TF_DSV41_KV_MIRROR": "4096",
     "TF_DSV41_STALL_EXIT_S": "300",
-    "TF_CUDA_SCHED": "blocking"
+    "TF_CUDA_SCHED": "blocking",
+    "TF_DSV41_COMPUTE_LANE": "0",
+    "TF_DSV41_COMPUTE_LANE_DEFAULT": "0",
+    "TF_DSV41_COMPUTE_LANE_RUNNER": "0",
+    "TF_DSV41_RUNNER": "0"
   }
 }

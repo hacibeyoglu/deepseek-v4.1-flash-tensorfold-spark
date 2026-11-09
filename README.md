@@ -62,7 +62,7 @@ Portable model settings live in [recipes](recipes); local paths and topology liv
 live in ignored `.stack/`. Downloads check file sizes by default; use `./stack verify-weights`
 for explicit checksum verification.
 
-`./stack fetch` exports the pinned candidate G native engine and the asset-generator references, then
+`./stack fetch` exports the pinned native engine and the asset-generator references, then
 applies the three Python patches for the TensorFold reference. The seven older runtime patches in
 [patches](patches) are retained as `legacy_patches` and are not applied. Upstream removed the Python patches
 from its own tree, so they are read from the commit recorded under `python_patches` in
@@ -72,6 +72,11 @@ See [source provenance](docs/SOURCES.md).
 The default profile uses four slots, 1,048,576 context per request, a shared 2.1M-token KV pool,
 FP8 index KV, DSpark, native images and SSD session reuse. These are configured capacities;
 see [validation limits](docs/VALIDATION.md) for tested workloads.
+
+The native engine pin includes upstream's NVMe session-restore fix. Computation stays **off** in the
+existing recipes. The optional `flash17-jay-exl3-2.8bpw-compute` recipe adopts upstream's experimental
+in-thinking compute profile. It can execute built-in Python calls and runner cells inside the engine;
+see [compute behavior and limits](docs/COMPUTE.md) before selecting it.
 
 Additional recipes cover Mia EAQ v1 and LibertAI EXL3 2.9 bpw. Mia remains experimental;
 LibertAI has limited TP=2 text validation. Supporting other model families requires runtime work.

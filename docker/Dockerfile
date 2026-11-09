@@ -1,4 +1,4 @@
-# Build context: src/ is the pinned TensorFold tree (candidate G), copied by
+# Build context: src/ is the pinned TensorFold tree, copied by
 # lib/sources.build_context from .stack/engine. Runtime assets use the retained
 # asset generators in .stack/source/engine/zig/tools/zig.
 ARG CUDA_DEVEL=nvcr.io/nvidia/cuda:13.0.1-devel-ubuntu24.04
@@ -18,7 +18,8 @@ ARG JPEG_TURBO_VERSION=3.1.4.1
 ARG JPEG_TURBO_SHA256=ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022
 ARG WEBP_VERSION=1.6.0
 ARG WEBP_SHA256=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
-RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates xz-utils python3 cmake make \
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates xz-utils python3 cmake make clang-18 lld-18 \
+    && ln -sf clang-18 /usr/bin/clang && ln -sf ld.lld-18 /usr/bin/ld.lld \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eu; url="${ZIG_URL:-https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz}"; \
     mkdir -p /opt/zig && curl -fsSL "$url" | tar -xJ -C /opt/zig --strip-components=1; \
@@ -35,8 +36,10 @@ RUN set -eu; test "$(cat .zig-version)" = "$ZIG_VERSION"; \
     zig build dsv41-assets -Dtarget="$ZIG_TARGET" -Dcpu="$ZIG_CPU" \
         -Dnvcc=/usr/local/cuda/bin/nvcc -Ddsv41-nvcc=/usr/local/cuda/bin/nvcc \
         -Dtp-fatbin=/tp_mailbox.fatbin -Dsm=121 -Doptimize=ReleaseSafe -j2 --prefix /out; \
+    zig build runner-frontend-check -Dtarget="$ZIG_TARGET" -Dcpu="$ZIG_CPU" -Doptimize=ReleaseSafe -j2 --prefix /out; \
     test -x /out/bin/tensorfold-dsv41 && test -x /out/bin/tf-dsv41; \
-    test -x /out/bin/tf-dsv41-token-map && test -x /out/bin/tf-dsv41-assets
+    test -x /out/bin/tf-dsv41-token-map && test -x /out/bin/tf-dsv41-assets; \
+    test -x /out/bin/tf-runner-frontend-check
 # The engine loads these from lib/ beside bin/ (packaging/RUNTIME.md): libtfgrammar for structured output and required
 # tool calls (HTTP 400 without it), over the xgrammar release the engine pins; the pinned JPEG and WebP decoders for
 # native image input.
@@ -80,6 +83,14 @@ assert libs["libwebpdecoder.so.3"].WebPGetDecoderVersion() == 0x010600; \
 assert b"libjpeg-turbo version 3.1.4.1 (build " in open("/out/lib/libturbojpeg.so.0", "rb").read(); \
 print("runtime libraries:", {n: len(s) for n, s in need.items()})'
 
+# Hash-check the archive and every extracted runner file, using the upstream helpers.
+# Only the head's image build downloads these optional-feature assets; workers receive the image.
+FROM ${CUDA_RUNTIME} AS runner-assets
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY runner-tooling /tooling
+RUN python3 /tooling/scripts/fetch_runner_assets.py /runner
+
 FROM ${CUDA_RUNTIME}
 ARG TENSORFOLD_REV=unknown
 # libnccl2 from the CUDA apt repo the nvidia images ship configured; libibverbs + the mlx5 provider for RoCE; cuBLAS /
@@ -87,16 +98,20 @@ ARG TENSORFOLD_REV=unknown
 # only with TF_DSV41_IMAGES=native. Its directory goes on the loader path (the base image's points at its own CUDA).
 # python3 is the compute lane's interpreter (TF_DSV41_COMPUTE_LANE, off by default; it runs /usr/bin/python3).
 RUN apt-get update && apt-get install -y --no-install-recommends libnccl2 libibverbs1 ibverbs-providers rdma-core \
-        curl ca-certificates python3 libcublas-13-3=13.6.0.2-1 \
+        curl ca-certificates python3 clang-18 lld-18 libcublas-13-3=13.6.0.2-1 \
+    && ln -sf clang-18 /usr/bin/clang && ln -sf ld.lld-18 /usr/bin/ld.lld \
     && apt-mark hold libcublas-13-3 \
     && dirname "$(dpkg -L libcublas-13-3 | grep '/libcublas\.so\.13$')" > /etc/ld.so.conf.d/990_cublas-13-3.conf && ldconfig \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /ctx/src/LICENSE /ctx/src/NOTICE /ctx/src/THIRD_PARTY_NOTICES.md /opt/tensorfold/licenses/
 COPY --from=build /ctx/src/LICENSES/ /opt/tensorfold/licenses/LICENSES/
-COPY --from=build /out/bin/tensorfold-dsv41 /out/bin/tf-dsv41 /out/bin/tf-dsv41-token-map /out/bin/tf-dsv41-assets /opt/tensorfold/bin/
+COPY --from=build /out/bin/tensorfold-dsv41 /out/bin/tf-dsv41 /out/bin/tf-dsv41-token-map /out/bin/tf-dsv41-assets /out/bin/tf-runner-frontend-check /opt/tensorfold/bin/
 COPY --from=build /out/lib/ /opt/tensorfold/lib/
 COPY --from=build /out/licenses/ /opt/tensorfold/licenses/runtime-deps/
 COPY --from=build /tp_mailbox.fatbin /opt/tensorfold/share/tp_mailbox.fatbin
+COPY --from=runner-assets /runner/ /opt/tensorfold/share/runner/
+COPY --from=runner-assets /runner/graph-v7-powmod/bank/Qwenputer-MIT.txt /opt/tensorfold/licenses/runtime-deps/Qwenputer-MIT.txt
+RUN /opt/tensorfold/bin/tf-runner-frontend-check --require --circuit /opt/tensorfold/share/runner/calc.tfpc
 # libproof: every library name the engine can dlopen is covered, each resolves here with its whole NEEDED chain, and
 # cuBLAS / cuBLASLt are the pinned 13.6.0.2 files by sha256; any miss or other build fails the image build.
 # The grammar and image decoders resolve from /opt/tensorfold/lib, where the engine looks first.

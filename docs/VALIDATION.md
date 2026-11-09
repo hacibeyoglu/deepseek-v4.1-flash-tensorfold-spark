@@ -1,10 +1,53 @@
 # Validation
 
-The dated runtime results below describe earlier export-based builds. The current source lock retains
-the local candidate G migration and merges the remote asset-source/Python-patch updates. The Git merge
-on 2026-11-09 passed all 100 orchestration tests, shell syntax checks and the isolated synthetic-node
-launch dry-run (`./scripts/test.sh`). It did not build, prepare or deploy that runtime; earlier GPU
-results do not qualify it.
+## Current source adoption (2026-11-09)
+
+Upstream recipe `24a84eb2cc81e297b827ba71126dafd5d755c561`, native engine
+`7b79ef92d846138d51638b677c473392a56e240c`, runtime fingerprint `33aee15015a600c4`.
+The standard recipes retain compute off; the new compute recipe is opt-in, as requested.
+No model revision, EXL3 bit rate, FP8 index KV, context or slot capacity was changed.
+
+| Check | Result |
+|---|---|
+| `./scripts/test.sh` | 108 tests passed, shell syntax checks and the isolated baseline dry-run passed |
+| All recipe launch plans | Four `run --setup --dry-run -n 192.0.2.11,192.0.2.12` plans passed |
+| Source assembly | Offline export, three hash-checked Python patches, repeat fetch, source verification and native build-context assembly passed |
+| Export identity | Tested native source is byte-identical to the assembled pinned engine; all configured engine names occur in upstream's pinned-settings manifest |
+| Runner packaging | Release/file manifests match upstream; corruption, unsafe paths, links, offline archives and runtime invalidation have local regression coverage; all 11 Dockerfile RUN blocks parse |
+| Engine host/golden suite | Ran with Zig 0.17.0 on x86_64: 448/451 steps succeeded, 2,911 tests passed, 115 skipped, one failed; both golden targets passed |
+| Session-codec regressions | 33/33 tests passed under the original device-host module graph filtered to `session_codec:`; includes all 13 NVMe restore regressions |
+| Runner host targets and frontend checker | Separate `test-runner-host test-runner-frontend-host runner-frontend-check` completed, 9/9 steps succeeded using the same build cache |
+
+The full host suite is **not clean**. The failure is
+`exl3_load.test.a scan that fails an allocation frees every group prefix it held`, reporting
+`NondeterministicMemoryUsage`; a retry with the same build seed repeated it. That test and its checkpoint,
+safetensors, index and save-guard dependencies are unchanged from candidate G. Running the filtered
+allocation test alone passed on both pins (2/2 each), so this review does not attribute the combined-run
+failure to the new engine. No engine source was patched to suppress it.
+
+The combined device-host/runner invocation exceeded a five-minute limit. The separate runner targets
+subsequently passed; the full `test-dsv41-device-host` population remains unqualified. The 13 session-codec
+cases were then run separately using the exact module graph emitted by the engine build and all passed.
+The CPU environment lacks the pinned JPEG/WebP/grammar libraries and runner circuit/compiler environment;
+related checks skip or warn. Runner host checks do not certify actual graph/circuit execution or image
+packaging. The complete ARM64 image build, frontend probe with release assets, GPU kernels, both-rank
+inference, actual compute, NVMe restore, modalities, maximum context and comparative performance have
+not been qualified for this pin.
+
+The initial sandboxed host run was stopped after socket-related failures; the reported combined run
+allowed local sockets. All runtime checks used task-owned local source/cache copies, not the live
+Sparks. Both ranks were running image `353a4dae4e8e` at inspection; no serving image was built or
+transferred, no weights were downloaded, and no service was stopped or restarted.
+
+Evidence is in ignored `.stack/review/`: `assembly.log`, `plans/`, `orchestration.log`,
+`native-host.log`, `native-host-retry.log`, `native-codec.log`, `native-runner.log` and
+`review-result.json`. Reproduce orchestration with `./scripts/test.sh`; after fetching sources,
+`./stack test-runtime` now runs the actual serving engine, the combined host/golden suite and the
+device/runner host targets. It needs Docker and an appropriate builder; see [BUILD.md](BUILD.md).
+Selection and maintenance-window commands are in [COMPUTE.md](COMPUTE.md).
+
+The older dated results below describe earlier export-based builds. They do not qualify the current
+native engine.
 
 ## Upstream-current re-test (2026-11-04)
 

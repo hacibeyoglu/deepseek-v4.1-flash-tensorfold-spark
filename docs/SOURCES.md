@@ -1,12 +1,43 @@
 # Source provenance
 
-Current source layout after the 2026-11-09 Git merge: serving builds the native candidate G engine at
-`jayleaton/TensorFold@58bece1d3184269059fd3f7f755c52f4f295113d` (base v1.1.8).
-The recipe repository at `ed96ef610693ff68ac5b1bec5881de72854554bd` supplies asset-generator
-references only. Its deleted Python patches come from the separately pinned, hash-checked
-`python_patches` entry. The seven runtime patches below are archived under `legacy_patches`;
-`patches` is empty. The dated reviews and runtime identities below describe earlier export-based
-builds, not the current native engine. This Git merge did not build or deploy a runtime.
+Current source layout, reviewed 2026-11-09: native serving builds
+[`jayleaton/TensorFold@7b79ef92d846`](https://github.com/jayleaton/TensorFold/commit/7b79ef92d846138d51638b677c473392a56e240c),
+published on `dsv41/compute-lane-release-s86`, with candidate G (`58bece1d3184`) recorded as a fallback reference; rollback is not automatic.
+The recipe repository at [`24a84eb`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/24a84eb)
+supplies asset-generator references only. Its deleted Python patches come from the separately pinned,
+hash-checked `python_patches` entry. The seven older runtime patches below are archived under
+`legacy_patches`; `patches` is empty.
+
+## Current upstream adoption
+
+Compared upstream `ed96ef610693` with `24a84eb`: two commits, #87 and #88. The retained `engine/`
+asset-generator tree is byte-identical across that comparison.
+
+- #87 replaces candidate G with the compute-lane release, adds `deadline_s`, the experimental in-model
+  runner, thinking-only default-tool admission, preservation of a client's own `python` tool, and
+  accounting of executed compute. The optional compute recipe follows upstream's nineteen compute
+  settings and leaves `TF_CUDA_SCHED` unset, as its measured profile does. Existing recipes keep their
+  prior settings, including `TF_CUDA_SCHED=blocking`, and explicitly disable the four compute switches.
+- #88 includes upstream TensorFold #2182: the NVMe session reader accepts replay stashes longer than
+  the ring and valid drafter offsets without drafter rings, fixing the reported `BadBlob` restore failure.
+  This is a source fix; upstream's timings are not measurements on Emre's Sparks.
+- The shared image builds `tf-runner-frontend-check`, installs clang/lld 18 and includes the pinned
+  runner circuit and graph bank. Both the release archive and every extracted file are SHA-256 checked.
+  The image build and image check require the frontend self-test. Only the head downloads/builds;
+  workers receive the image through the existing verified fabric transfer.
+- `scripts/fetch_runner_assets.py`, `scripts/check_runner_assets.py`, the release pin and file manifest
+  are adopted from upstream `24a84eb`. The Python helpers use ordinary CLI output here instead of the
+  upstream launcher's `safe_output` adapter; integrity and extraction checks are retained. They run
+  through Docker during `./stack build`, not on the worker or during ordinary setup discovery.
+- The runtime fingerprint includes runner manifests and helper bytes. Runtime host tests now copy
+  `.stack/engine`, the actual serving source, instead of the retained legacy generator engine.
+
+Model revisions, EXL3 bit rates, FP8 index KV and existing capacities are preserved. No benchmark archive was vendored into tracked files, and no upstream watchdog, thermal policy,
+authentication change or site configuration was adopted. For optional compute
+behavior, evidence limits and commands, see [COMPUTE.md](COMPUTE.md).
+
+The dated reviews and runtime identities below describe earlier export-based builds, not this native
+engine. This source adoption did not build or deploy a serving image.
 
 Code and checkpoint metadata checked on 2026-10-26; `main-0rand` runtime equivalence rechecked on
 2026-10-27; the runtime/tooling base moved to upstream `391d677b` on 2026-10-30 and to `ed96ef610693`
@@ -17,7 +48,8 @@ Serving defaults, source-to-runtime mappings and deliberate differences are in [
 
 | Component | Source |
 |---|---|
-| Asset-generator reference | [jayleaton `ed96ef610693`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/ed96ef610693ff68ac5b1bec5881de72854554bd) |
+| Native engine | [jayleaton `7b79ef92d846`](https://github.com/jayleaton/TensorFold/commit/7b79ef92d846138d51638b677c473392a56e240c) |
+| Asset-generator reference | [jayleaton `24a84eb`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/24a84eb) |
 | Serving changes | [0rand `305659970ae6`](https://github.com/0rand/deepseek-v41-tensorfold-spark/commit/305659970ae63729b0753b27dea85a7ac4b5a93b), `pr65-flash17-serving` |
 | Common ancestor | `853310dab967480013eda7cef4e79c2fd041629a` |
 | Asset Python reference | [ashhart/TensorFold `c4646171139e`](https://github.com/ashhart/TensorFold/commit/c4646171139ee8a3c38103eaa1699dad226ec12b), plus the base repository's three Python patches |

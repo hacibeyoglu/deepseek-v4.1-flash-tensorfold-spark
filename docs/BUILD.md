@@ -39,7 +39,7 @@ With the stack stopped:
 ./stack start
 ```
 
-`./stack fetch` exports the candidate G native engine and the asset-generator references. The seven older
+`./stack fetch` exports the pinned native engine and the asset-generator references. The seven older
 runtime patches in [patches](../patches) are archived under `legacy_patches` and are not applied.
 The three Python patches for the TensorFold reference are read from the commit recorded
 under `python_patches` in [sources.lock.json](../sources.lock.json), because upstream removed `patches/` from its
@@ -79,7 +79,11 @@ and can take time even when the cache is already populated. API readiness and ge
 ## Runtime images and reuse
 
 `./stack build` builds the runtime image on the head and streams `docker save` into worker `docker load`.
-All recipes use **`spark-ds41-tensorfold:latest`**, the only retained stack runtime tag.
+All recipes use **`spark-ds41-tensorfold:latest`**, the only retained stack runtime tag. The image
+includes the optional compute runner: clang/lld 18, the circuit and the graph bank. Its build downloads
+the pinned runner release on the head and verifies the archive and all files before copying them into
+the runtime. It runs the frontend self-test before publishing the image. Compute remains disabled in
+the standard recipes; see [COMPUTE.md](COMPUTE.md) for the opt-in recipe.
 Builds skip images whose runtime fingerprint already matches the source lock, patches, and Dockerfile.
 Updating those inputs replaces the same tags. Recipe changes reuse the runtime and select their own assets.
 The fingerprint remains in image labels and asset paths; preparation/start reject a stale runtime.

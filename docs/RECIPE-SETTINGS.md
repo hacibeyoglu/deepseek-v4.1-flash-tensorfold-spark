@@ -1,10 +1,11 @@
 # Recipe settings and their origins
 
-The candidate G migration changes the runtime and several environment names described in this older
+The native engine migration changes the runtime and several environment names described in this older
 profile review. Current executable settings are in `recipes/*.json`, with accepted names in
 `lib/config.py`. In particular, the Jayleaton profile now uses `TF_TP_*`, `TENSORFOLD_REQUEST_LOG`,
 `TF_SSE_KEEPALIVE_S` and a 4.75 GiB prefill workspace floor. The legacy export comparisons below
-remain historical; their validation does not qualify candidate G.
+remain historical; their validation does not qualify the current engine. Existing recipes explicitly
+keep compute off. The new opt-in compute recipe and its differences are in [COMPUTE.md](COMPUTE.md).
 
 Reviewed 2026-10-26 against the then-pinned launchers and engine readers; the links below now track the
 2026-11-03 source pin. These are translations into this repository's combined Zig runtime, not copies of

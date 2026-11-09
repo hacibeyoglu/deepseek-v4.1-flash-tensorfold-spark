@@ -14,11 +14,13 @@ if [[ "${1:-}" != --inside ]]; then
         -s -- --inside < "${BASH_SOURCE[0]}"
 fi
 fail=0
-for binary in tensorfold-dsv41 tf-dsv41 tf-dsv41-token-map tf-dsv41-assets; do
+for binary in tensorfold-dsv41 tf-dsv41 tf-dsv41-token-map tf-dsv41-assets tf-runner-frontend-check; do
     [[ -x "$BIN/$binary" ]] || { echo "  $binary: MISSING"; fail=1; }
 done
 [[ -f /opt/tensorfold/share/tp_mailbox.fatbin ]] || { echo "  tp_mailbox.fatbin: MISSING"; fail=1; }
 [[ -x /usr/bin/python3 ]] || { echo "  /usr/bin/python3: MISSING (compute lane)"; fail=1; }
+"$BIN/tf-runner-frontend-check" --require --circuit /opt/tensorfold/share/runner/calc.tfpc || fail=1
+[[ -f /opt/tensorfold/share/runner/graph-v7-powmod/bank/bank.json ]] || { echo "  runner graph bank: MISSING"; fail=1; }
 bash /opt/tensorfold/share/libproof.sh || fail=1
 (( fail == 0 )) && echo "check-zig-image: OK" || echo "check-zig-image: FAILED"
 exit $fail

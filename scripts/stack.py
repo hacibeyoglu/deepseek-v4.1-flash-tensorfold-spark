@@ -94,7 +94,8 @@ def runtime_tests(image):
     # std.testing.tmpDir and the HTTP corpus create fixtures beneath the source cwd.
     # Use a disposable writable copy, keeping the reviewed export unchanged.
     test_source = cache / "source"
-    shutil.copytree(ROOT / ".stack/source/engine/zig", test_source, dirs_exist_ok=True,
+    if test_source.exists(): shutil.rmtree(test_source)
+    shutil.copytree(ROOT / ".stack/engine", test_source,
                     ignore=shutil.ignore_patterns(".zig-cache", "zig-out", "__pycache__"))
     import os
     sources.run(["docker", "run", "--rm", "--network", "none", "--cpus", "4", "--memory", "16g",
@@ -103,7 +104,8 @@ def runtime_tests(image):
                  "--env", "ZIG_GLOBAL_CACHE_DIR=/cache/global",
                  "--mount", f"type=bind,src={test_source},dst=/src",
                  "--mount", f"type=bind,src={cache},dst=/cache", "--workdir", "/src",
-                 "--entrypoint", "/opt/zig/zig", image, "build", "test", "test-golden", "-j4",
+                 "--entrypoint", "/opt/zig/zig", image, "build", "test", "test-golden",
+                 "test-dsv41-device-host", "test-runner-host", "test-runner-frontend-host", "-j4",
                  "--cache-dir", "/cache/local", "--prefix", "/tmp/out"])
 
 

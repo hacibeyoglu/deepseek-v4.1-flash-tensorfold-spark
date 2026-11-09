@@ -145,4 +145,11 @@ def build_context(root):
     if src.exists(): shutil.rmtree(src)
     shutil.copytree(root / ".stack/engine", src,
                     ignore=shutil.ignore_patterns(".git", ".zig-cache", "zig-out", "__pycache__"))
+    lock = read_json(root / "sources.lock.json")
+    if "runner_assets" in lock:
+        tooling = context / "runner-tooling"
+        for name in (*lock["runner_assets"].values(), "scripts/fetch_runner_assets.py", "scripts/check_runner_assets.py"):
+            target = tooling / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / name, target)
     return context
