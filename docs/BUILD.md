@@ -28,8 +28,8 @@ starts an already-prepared stack. All shell wrappers live in `scripts/`.
 
 Review upstream changes and preserve local edits before changing [sources.lock.json](../sources.lock.json)
 or [patches](../patches). Follow the source review process in [SOURCES.md](SOURCES.md).
-After editing orchestration, run `./scripts/test.sh`; runtime patches also require the combined host tests.
-With the stack stopped:
+After editing orchestration, run `./scripts/test.sh`; engine and runtime patches also require the combined
+host tests. With the stack stopped:
 
 ```bash
 ./stack fetch
@@ -41,6 +41,9 @@ With the stack stopped:
 
 `./stack fetch` exports the pinned native engine and the asset-generator references. The seven older
 runtime patches in [patches](../patches) are archived under `legacy_patches` and are not applied.
+The two reviewed engine patches in [patches/engine](../patches/engine) are applied after export; each is
+checked against its pinned SHA-256 and the assembled tree must match the `tree` value in
+[sources.lock.json](../sources.lock.json).
 The three Python patches for the TensorFold reference are read from the commit recorded
 under `python_patches` in [sources.lock.json](../sources.lock.json), because upstream removed `patches/` from its
 own tree; each file is checked against its pinned SHA-256 before it is applied. A supplied `--source-cache` is

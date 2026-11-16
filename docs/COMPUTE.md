@@ -1,11 +1,12 @@
 # Optional in-engine compute
 
-Reviewed 2026-11-09 against upstream recipe `24a84eb2cc81e297b827ba71126dafd5d755c561` and native
-engine `7b79ef92d846138d51638b677c473392a56e240c`.
+Reviewed 2026-11-16 against upstream recipe `13db91e` and native engine `12257eb51fd`, plus engine
+patches `0090` and `0091`. The previous review used `24a84eb` and `7b79ef92d846`.
 
 The standard recipes retain their existing serving settings and explicitly disable the sandbox lane,
-default tool injection, runner-first tool execution and in-thinking runner. The engine update still
-includes the NVMe session-restore fix for replay sessions rejected with `BadBlob`.
+default tool injection, runner-first tool execution and in-thinking runner. The engine update includes
+the NVMe session-restore fix, upstream's session-checkpoint commits and undeclared tool-call
+passthrough.
 
 `flash17-jay-exl3-2.8bpw-compute` is an opt-in copy of the standard Jayleaton recipe with upstream's
 nineteen compute settings. It keeps the checkpoint, precision, context, slot count, KV pool and other
@@ -21,6 +22,12 @@ every thinking chat; tool admission additionally requires at least 1024 output t
 strings, logprobs or structured output. Client function tools still return to the client; a client
 function named `python` retains that name and suppresses the built-in tool for that request.
 `runtime.compute_executed` counts execution, not merely a declaration.
+
+The engine reads `TF_DSV41_RUNNER_SPANS`; `reasoning` limits runner cells to the think block, while the
+default and the shipped compute recipe keep every span. Patch `0091` drops an armed or pending trace
+when the think block closes, so enabling `reasoning` no longer writes `[exact: ...]` into the answer.
+The recipe leaves the setting unset to preserve its current behavior; enabling it is a behavior change
+that still needs live compute validation.
 
 The Python sandbox requires Landlock ABI 6 and seccomp, runs as nobody and disallows network and child
 processes. Its read/execute boundary includes `/usr`, the interpreter install root and specific runtime

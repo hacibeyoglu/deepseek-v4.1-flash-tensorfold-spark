@@ -487,14 +487,21 @@ class SourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for folder in ("patches", "docker", ".stack"): (root / folder).mkdir()
+            (root / "patches/engine").mkdir()
             subprocess.run(["git", "init", "--quiet", str(root)], check=True)
             (root / "docker/Dockerfile").write_text("FROM example\n")
             (root / "patches/change.patch").write_text(
                 "diff --git a/engine/file b/engine/file\n--- a/engine/file\n+++ b/engine/file\n@@ -1 +1 @@\n-old\n+combined\n")
-            (root / "sources.lock.json").write_text(json.dumps({"engine": {}, "upstream": {}, "python_reference": {}, "patches": ["patches/change.patch"]}))
+            engine_patch = ("diff --git a/native.zig b/native.zig\n--- a/native.zig\n+++ b/native.zig\n"
+                            "@@ -1 +1 @@\n-old\n+patched\n")
+            (root / "patches/engine/change.patch").write_text(engine_patch)
+            engine_spec = {"patches": {"patches/engine/change.patch": hashlib.sha256(engine_patch.encode()).hexdigest()}}
+            (root / "sources.lock.json").write_text(json.dumps({"engine": engine_spec, "upstream": {}, "python_reference": {}, "patches": ["patches/change.patch"]}))
             def fake_export(root, spec, destination, cache=None):
                 destination.mkdir()
-                if destination.name == "source":
+                if destination.name == "engine":
+                    (destination / "native.zig").write_text("old\n")
+                elif destination.name == "source":
                     (destination / "engine").mkdir()
                     (destination / "engine/file").write_text("old\n")
                 else: (destination / "reference.py").write_text("pass\n")
@@ -507,6 +514,7 @@ class SourceTests(unittest.TestCase):
                 subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
             with patch("lib.sources.export", side_effect=fake_export), patch("lib.sources.python_patches", side_effect=fake_patches), patch("lib.sources.run", side_effect=quiet_run):
                 sources.fetch(root)
+                self.assertEqual((root / ".stack/engine/native.zig").read_text(), "patched\n")
                 self.assertEqual((root / ".stack/source/engine/file").read_text(), "combined\n")
                 self.assertEqual((root / ".stack/python-source/reference.py").read_text(), "patched\n")
                 sources.verify(root)
@@ -569,6 +577,35 @@ class SourceTests(unittest.TestCase):
             self.assertEqual(sorted((root / "source/patches").glob("*.patch")), [])
             self.assertFalse((root / "source/patches").exists())
 
+    def test_engine_patches_apply_and_verify_hash_and_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "patches/engine").mkdir(parents=True)
+            patch_text = ("diff --git a/native.zig b/native.zig\n--- a/native.zig\n+++ b/native.zig\n"
+                          "@@ -1 +1 @@\n-old\n+patched\n")
+            patch_path = root / "patches/engine/change.patch"
+            patch_path.write_text(patch_text)
+            spec = {"patches": {str(patch_path.relative_to(root)): hashlib.sha256(patch_text.encode()).hexdigest()}}
+            first = root / "first"
+            first.mkdir()
+            (first / "native.zig").write_text("old\n")
+            sources.apply_engine_patches(root, spec, first)
+            self.assertEqual((first / "native.zig").read_text(), "patched\n")
+            spec["tree"] = sources.tree_hash(first)
+            second = root / "second"
+            second.mkdir()
+            (second / "native.zig").write_text("old\n")
+            sources.apply_engine_patches(root, spec, second)
+            spec["tree"] = "0" * 64
+            third = root / "third"
+            third.mkdir()
+            (third / "native.zig").write_text("old\n")
+            with self.assertRaisesRegex(StackError, "pinned tree"):
+                sources.apply_engine_patches(root, spec, third)
+            spec["patches"][str(patch_path.relative_to(root))] = "0" * 64
+            with self.assertRaisesRegex(StackError, "changed"):
+                sources.apply_engine_patches(root, spec, third)
+
     def test_runtime_id_tracks_patch_changes(self):
         from lib.config import runtime_id
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,9 +613,15 @@ class SourceTests(unittest.TestCase):
             (root / "docker").mkdir()
             (root / "docker/Dockerfile").write_text("FROM fixture\n")
             (root / "change.patch").write_text("first\n")
-            (root / "sources.lock.json").write_text(json.dumps({"patches": ["change.patch"]}))
+            (root / "engine.patch").write_text("first\n")
+            (root / "sources.lock.json").write_text(json.dumps({
+                "patches": ["change.patch"],
+                "engine": {"patches": {"engine.patch": "0" * 64}},
+            }))
             before = runtime_id(root)
             (root / "change.patch").write_text("second\n")
+            self.assertNotEqual(before, runtime_id(root))
+            (root / "engine.patch").write_text("second\n")
             self.assertNotEqual(before, runtime_id(root))
 
 

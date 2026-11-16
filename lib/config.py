@@ -132,7 +132,7 @@ def load_recipe(root, name):
 def runtime_id(root):
     root = Path(root)
     lock = read_json(root / "sources.lock.json")
-    files = [*lock["patches"], "docker/Dockerfile"]
+    files = [*lock.get("patches", []), *lock.get("engine", {}).get("patches", {}), "docker/Dockerfile"]
     if "runner_assets" in lock:
         files += [*lock["runner_assets"].values(), "scripts/fetch_runner_assets.py", "scripts/check_runner_assets.py"]
     return digest({"lock": lock, "files": {p: hashlib.sha256((root / p).read_bytes()).hexdigest() for p in files}})[:16]

@@ -28,6 +28,29 @@ def tree_hash(root):
     return h.hexdigest()
 
 
+def apply_engine_patches(root, spec, destination):
+    """Apply the reviewed engine patches and verify the assembled tree.
+
+    The native engine is exported at one commit; patches that upstream publishes after that
+    commit are kept here with their SHA-256 in the lock. GNU patch is used rather than git apply
+    because the export sits inside the orchestration repository and must not resolve paths
+    against the parent .git.
+    """
+    root = Path(root)
+    for name, expected in sorted(spec.get("patches", {}).items()):
+        path = root / name
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise StackError(f"Pinned engine patch {name} changed: {actual} != {expected}")
+        run(["patch", "--batch", "--forward", "--fuzz=0", "--no-backup-if-mismatch", "-p1", "-i", str(path)],
+            cwd=destination)
+    expected_tree = spec.get("tree")
+    if expected_tree:
+        actual_tree = tree_hash(destination)
+        if actual_tree != expected_tree:
+            raise StackError(f"Engine tree {actual_tree} does not match the pinned tree {expected_tree}")
+
+
 def export(root, spec, destination, cache=None):
     git = Path(cache) if cache else root / ".stack/git" / spec["commit"]
     if cache is None:
@@ -105,6 +128,7 @@ def fetch(root, upstream_cache=None, python_cache=None, engine_cache=None):
     with tempfile.TemporaryDirectory(prefix="fetch-", dir=root / ".stack") as tmp:
         tmp = Path(tmp)
         export(root, lock["engine"], tmp / "engine", engine_cache)
+        apply_engine_patches(root, lock["engine"], tmp / "engine")
         export(root, lock["upstream"], tmp / "source", upstream_cache)
         for name in lock["patches"]:
             # Export directories may sit inside the orchestration repository. patch does not discover a parent .git.

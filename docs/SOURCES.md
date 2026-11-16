@@ -1,14 +1,56 @@
 # Source provenance
 
-Current source layout, reviewed 2026-11-09: native serving builds
-[`jayleaton/TensorFold@7b79ef92d846`](https://github.com/jayleaton/TensorFold/commit/7b79ef92d846138d51638b677c473392a56e240c),
-published on `dsv41/compute-lane-release-s86`, with candidate G (`58bece1d3184`) recorded as a fallback reference; rollback is not automatic.
+Current source layout, reviewed 2026-11-16: native serving builds
+[`jayleaton/TensorFold@12257eb51fd`](https://github.com/jayleaton/TensorFold/commit/12257eb51fd2236b65b0e0d8197836e225b95cf5),
+published on `dsv41/undeclared-tool-passthrough`, four commits after the previous `7b79ef92d846` pin.
+`./stack fetch` applies the two reviewed engine patches in [patches/engine](../patches/engine) and
+verifies their SHA-256 and the assembled tree. The previous `7b79ef92d846` pin is recorded as the
+fallback reference; rollback is not automatic.
 The recipe repository at [`24a84eb`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/24a84eb)
 supplies asset-generator references only. Its deleted Python patches come from the separately pinned,
-hash-checked `python_patches` entry. The seven older runtime patches below are archived under
-`legacy_patches`; `patches` is empty.
+hash-checked `python_patches` entry. The seven older runtime patches below remain archived under
+`legacy_patches`; `patches` (asset-source patches) is empty, while `engine.patches` holds the two
+native-engine patches.
 
-## Current upstream adoption
+## Upstream review, 2026-11-16
+
+Reviewed upstream `13db91e` (2026-11-16), 14 commits after the previously pinned `24a84eb`
+(#89-#103). The retained `engine/` asset-generator tree and the `python_patches` pin are unchanged.
+
+Adopted:
+
+- The engine pin moves from `7b79ef92d846` to `12257eb51fd` on
+  `dsv41/undeclared-tool-passthrough`, four commits: #80's prompt checkpoints and checkpoint-spacing
+  fix, and the two undeclared-tool commits. The engine logs costly session misses;
+  `TF_DSV41_SESSION_LCP_RESUME` stays off by default, and no recipe enables it. A whole tool call to an
+  undeclared name is returned as a `tool_calls` entry instead of text, matching vLLM. Upstream's
+  OpenCode 2.2.7 report (four failed trials of 30) and its timings are upstream evidence, not
+  measurements on these Sparks.
+- Engine patches `0090` and `0091` are applied after export, with SHA-256 and assembled-tree checks.
+  `0090` makes identical short prompts repeat under `TF_DSV41_PREFILL=replay` (our recipes use replay;
+  a prompt of 17 tokens or fewer could differ run to run). `0091` drops an armed or pending trace when
+  the think block closes under `TF_DSV41_RUNNER_SPANS=reasoning`; the shipped compute recipe leaves the
+  span setting unset, so its current all-span behavior is unchanged.
+- The source lock records the previous pin as `fallback_commit`. Rollback is still a manual fetch and
+  rebuild.
+
+Not adopted:
+
+- Patch `0088` (DSpark staging alignment) is not vendored. It fixes a panic above 12 live slots; this
+  launcher exposes at most eight, where four and eight slots are unchanged upstream.
+- Upstream #91/#92/#94/#98 rebase the engine on upstream `f212eeabd` plus G's 72-patch series and the
+  Qwen compute-lane patches `0073`-`0087`, add adaptive context (`0089`), and move the image to a CUDA
+  13.3 forward-compatibility layer. That is a 2,517-commit upstream rebase with new AOT and prepared
+  assets and a different image build; it needs a separate TP=2 and live qualification. The eight-slot
+  default/192K option and adaptive context are not adopted.
+- Upstream's watchdog, thermal policy, authentication, site configuration and `results/` evidence are
+  not vendored. The undeclared-tool rows are referenced, not copied.
+
+The engine bump changes the runtime fingerprint. Prepared weight images are reused only when their
+native format key matches; AOT assets must be regenerated for the new engine tree. Build, prepare and
+start in a maintenance window; see [validation](VALIDATION.md#upstream-review-2026-11-16).
+
+## Previous upstream adoption, 2026-11-09
 
 Compared upstream `ed96ef610693` with `24a84eb`: two commits, #87 and #88. The retained `engine/`
 asset-generator tree is byte-identical across that comparison.
@@ -48,7 +90,8 @@ Serving defaults, source-to-runtime mappings and deliberate differences are in [
 
 | Component | Source |
 |---|---|
-| Native engine | [jayleaton `7b79ef92d846`](https://github.com/jayleaton/TensorFold/commit/7b79ef92d846138d51638b677c473392a56e240c) |
+| Native engine | [jayleaton `12257eb51fd`](https://github.com/jayleaton/TensorFold/commit/12257eb51fd2236b65b0e0d8197836e225b95cf5) |
+| Engine patches | [upstream `13db91e`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/13db91e) `patches/0090`-`0091`, SHA-256 pinned in the lock |
 | Asset-generator reference | [jayleaton `24a84eb`](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/commit/24a84eb) |
 | Serving changes | [0rand `305659970ae6`](https://github.com/0rand/deepseek-v41-tensorfold-spark/commit/305659970ae63729b0753b27dea85a7ac4b5a93b), `pr65-flash17-serving` |
 | Common ancestor | `853310dab967480013eda7cef4e79c2fd041629a` |

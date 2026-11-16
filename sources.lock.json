@@ -2,10 +2,15 @@
   "schema": 1,
   "engine": {
     "url": "https://github.com/jayleaton/TensorFold.git",
-    "commit": "7b79ef92d846138d51638b677c473392a56e240c",
-    "branch": "dsv41/compute-lane-release-s86",
-    "base_upstream": "v1.1.8",
-    "fallback_commit": "58bece1d3184269059fd3f7f755c52f4f295113d"
+    "commit": "12257eb51fd2236b65b0e0d8197836e225b95cf5",
+    "branch": "dsv41/undeclared-tool-passthrough",
+    "base_upstream": "0d51120a8d88ace54e833a78ddffc7fe6768f872",
+    "fallback_commit": "7b79ef92d846138d51638b677c473392a56e240c",
+    "patches": {
+      "patches/engine/0090-dsv41-CED-replay-s-short-decoder-boundaries-write-th.patch": "e606e534a4a6aa8807df156f739959c3a51ec1a2a262c8a75a56e74cb1257d1c",
+      "patches/engine/0091-runner-reasoning_only-drops-armed-and-pending-trace-.patch": "b179dd2c9cc3c34bf411222331f6156deb041d5372b378f1ec08d310e05f05b2"
+    },
+    "tree": "736578243560441d7f54b83d482682fe7e3820fd5f87f55d2369e3981906eca2"
   },
   "upstream": {
     "url": "https://github.com/jayleaton/deepseek-v41-tensorfold-spark.git",

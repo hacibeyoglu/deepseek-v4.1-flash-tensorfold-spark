@@ -105,6 +105,10 @@ class RunnerAssetTests(unittest.TestCase):
                 dest = root / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, dest)
+            for name in lock["engine"].get("patches", {}):
+                dest = root / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, dest)
             (root / ".stack/engine").mkdir(parents=True)
             (root / ".stack/engine/native.zig").write_text("engine")
             with patch.object(sources, "verify"):
