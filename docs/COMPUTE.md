@@ -1,12 +1,13 @@
 # Optional in-engine compute
 
-Reviewed 2026-11-16 against upstream recipe `13db91e` and native engine `12257eb51fd`, plus engine
-patches `0090` and `0091`. The previous review used `24a84eb` and `7b79ef92d846`.
+Reviewed 2026-11-19 against upstream recipe `13db91e` and native engine `f212eeabd` plus its
+`0001`-`0091` series, which reproduces upstream's G19 engine. The previous review used
+`12257eb51fd` plus `0090`/`0091`; before that, `24a84eb` and `7b79ef92d846`.
 
 The standard recipes retain their existing serving settings and explicitly disable the sandbox lane,
 default tool injection, runner-first tool execution and in-thinking runner. The engine update includes
-the NVMe session-restore fix, upstream's session-checkpoint commits and undeclared tool-call
-passthrough.
+the NVMe session-restore fix, upstream's session-checkpoint commits, undeclared tool-call
+passthrough and the Qwen lane fixes `0073`-`0087`.
 
 `flash17-jay-exl3-2.8bpw-compute` is an opt-in copy of the standard Jayleaton recipe with upstream's
 nineteen compute settings. It keeps the checkpoint, precision, context, slot count, KV pool and other
@@ -28,6 +29,12 @@ default and the shipped compute recipe keep every span. Patch `0091` drops an ar
 when the think block closes, so enabling `reasoning` no longer writes `[exact: ...]` into the answer.
 The recipe leaves the setting unset to preserve its current behavior; enabling it is a behavior change
 that still needs live compute validation.
+
+Upstream's flash17 compute profile also sets `TF_DSV41_RUNNER_SPANS=reasoning`,
+`TF_DSV41_RUNNER_DIGIT_HOLD_MAX=0` and `TF_DSV41_RUNNER_MARK_STOP=0`. This recipe leaves all three
+unset, so runner cells may appear in every span and a stopped digit run keeps the engine defaults
+(hold 64 digits; mark stop on, with the inline mark itself off). Set the three values to match
+upstream's exact compute profile; that is a behavior change needing live validation.
 
 The Python sandbox requires Landlock ABI 6 and seccomp, runs as nobody and disallows network and child
 processes. Its read/execute boundary includes `/usr`, the interpreter install root and specific runtime

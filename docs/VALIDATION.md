@@ -1,6 +1,26 @@
 # Validation
 
-## Current source adoption (2026-11-09)
+## Engine migration (2026-11-19)
+
+Native engine `f212eeabd` plus all 91 patches in [patches/engine](../patches/engine), upstream recipe
+`13db91e`. Runtime fingerprint `4f973670e683c2b8`; assembled content tree
+`da6e4b47975662c46ddae1bf1deba243f1d5032029332bcfb57ab0ecda38bc16`.
+
+| Check | Result |
+|---|---|
+| Patch series | 91/91 applied in order with `git am`; HEAD `4684b511b`; Git tree `d73f715ca9892d6f8801f33d2164780390490746` equals upstream `config/tensorfold.tree` |
+| Assembled content | Stack `tree` matches the lock; the export check behind `./stack verify` passes on this checkout (no `cluster.json` here, so the full command was run on the Spark) |
+| Orchestration | `./scripts/test.sh`: shell syntax checks, 110 unit tests and the isolated dry-run pass |
+| Recipe plans | All four `run --setup --dry-run -n 192.0.2.11,192.0.2.12` plans pass |
+| Recipe settings | Every non-launcher key in the four recipes occurs in the engine's 710-name manifest; the manifest set equals upstream `config/tensorfold-settings.txt` |
+| Build inputs | `build.zig` defines `dsv41-serve`, `dsv41-assets`, `runner-frontend-check`, `grammar`, `-Ddsv41-nvcc`, `-Dtp-fatbin` and `-Dsm`; runner-asset release and manifest are unchanged; `libproof`'s not-requested list now matches upstream (HIP/ROCm, video, PDFium) |
+
+Not qualified: the ARM64/GB10 image build, GPU kernels, both-rank inference, compute execution, NVMe
+restore, modalities, maximum context and comparative performance. This dev box has no `zig`, no
+`nvcc` and no usable Docker. The live pair still runs the previous engine until a build, prepare and
+restart. The dated evidence below does not qualify this pin.
+
+## Previous source adoption (2026-11-09)
 
 Upstream recipe `24a84eb2cc81e297b827ba71126dafd5d755c561`, native engine
 `7b79ef92d846138d51638b677c473392a56e240c`, runtime fingerprint `33aee15015a600c4`.

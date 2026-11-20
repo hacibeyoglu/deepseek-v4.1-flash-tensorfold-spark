@@ -29,26 +29,76 @@ def tree_hash(root):
 
 
 def apply_engine_patches(root, spec, destination):
-    """Apply the reviewed engine patches and verify the assembled tree.
+    """Apply the reviewed engine patch series and verify the assembled trees.
 
-    The native engine is exported at one commit; patches that upstream publishes after that
-    commit are kept here with their SHA-256 in the lock. GNU patch is used rather than git apply
-    because the export sits inside the orchestration repository and must not resolve paths
-    against the parent .git.
+    The pinned engine is exported as a Git checkout and the series is applied
+    with `git am`, which carries binary hunks and each patch's author exactly as
+    upstream applies it. A plain directory is accepted for synthetic tests and
+    falls back to GNU patch, which cannot carry binary hunks.
     """
-    root = Path(root)
-    for name, expected in sorted(spec.get("patches", {}).items()):
+    root, destination = Path(root), Path(destination)
+    patches = sorted(spec.get("patches", {}).items())
+    for name, expected in patches:
         path = root / name
         actual = hashlib.sha256(path.read_bytes()).hexdigest()
         if actual != expected:
             raise StackError(f"Pinned engine patch {name} changed: {actual} != {expected}")
-        run(["patch", "--batch", "--forward", "--fuzz=0", "--no-backup-if-mismatch", "-p1", "-i", str(path)],
-            cwd=destination)
+    if (destination / ".git").exists():
+        args = ["git", "-C", str(destination),
+                "-c", "user.name=TensorFold recipe", "-c", "user.email=recipe@invalid",
+                "-c", "core.autocrlf=false", "am", "--quiet",
+                "--committer-date-is-author-date", "--whitespace=nowarn"]
+        args += [str(root / name) for name, _ in patches]
+        try:
+            run(args)
+        except subprocess.CalledProcessError as exc:
+            subprocess.run(["git", "-C", str(destination), "am", "--abort"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            raise StackError("Engine patch series did not apply") from exc
+        expected_git = spec.get("git_tree")
+        if expected_git:
+            actual_git = subprocess.check_output(
+                ["git", "-C", str(destination), "rev-parse", "HEAD^{tree}"], text=True).strip()
+            if actual_git != expected_git:
+                raise StackError(f"Engine git tree {actual_git} does not match the pinned tree {expected_git}")
+    else:
+        for name, _ in patches:
+            if b"GIT binary patch" in (root / name).read_bytes():
+                raise StackError(f"Engine patch {name} carries a binary hunk; apply the series in a Git checkout")
+            run(["patch", "--batch", "--forward", "--fuzz=0", "--no-backup-if-mismatch", "-p1", "-i", str(root / name)],
+                cwd=destination)
     expected_tree = spec.get("tree")
     if expected_tree:
         actual_tree = tree_hash(destination)
         if actual_tree != expected_tree:
             raise StackError(f"Engine tree {actual_tree} does not match the pinned tree {expected_tree}")
+
+
+def export_engine(spec, destination, cache=None):
+    """Materialize the pinned engine as a Git checkout.
+
+    The patch series was authored against a checkout, so the export keeps the
+    file modes and checkout result the series expects instead of relying on
+    `git archive`, whose output can differ from a checkout.
+    """
+    destination = Path(destination)
+    if destination.exists():
+        raise StackError(f"Engine export destination already exists: {destination}")
+    if cache is not None and subprocess.run(
+            ["git", "-C", str(cache), "cat-file", "-e", spec["commit"] + "^{commit}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        run(["git", "clone", "--quiet", "--shared", "--no-checkout", str(cache), str(destination)])
+        run(["git", "-C", str(destination), "checkout", "--quiet", "--detach", spec["commit"]])
+    else:
+        destination.mkdir(parents=True)
+        run(["git", "init", "--quiet", str(destination)])
+        run(["git", "-C", str(destination), "remote", "add", "origin", spec["url"]])
+        run(["git", "-C", str(destination), "fetch", "--quiet", "--depth=1", "--no-tags",
+             "origin", spec["commit"]])
+        run(["git", "-C", str(destination), "checkout", "--quiet", "--detach", "FETCH_HEAD"])
+    head = subprocess.check_output(["git", "-C", str(destination), "rev-parse", "HEAD"], text=True).strip()
+    if head != spec["commit"]:
+        raise StackError(f"Engine export resolved {head}, not the pinned {spec['commit']}")
 
 
 def export(root, spec, destination, cache=None):
@@ -127,7 +177,7 @@ def fetch(root, upstream_cache=None, python_cache=None, engine_cache=None):
             dest.rename(previous)
     with tempfile.TemporaryDirectory(prefix="fetch-", dir=root / ".stack") as tmp:
         tmp = Path(tmp)
-        export(root, lock["engine"], tmp / "engine", engine_cache)
+        export_engine(lock["engine"], tmp / "engine", engine_cache)
         apply_engine_patches(root, lock["engine"], tmp / "engine")
         export(root, lock["upstream"], tmp / "source", upstream_cache)
         for name in lock["patches"]:

@@ -30,6 +30,7 @@ LEGACY_ENV = {
     "TF_DSV41_DISCONNECT": "removed; TF_DRAIN_S bounds in-flight requests",
     "TF_DSV41_SESSION_DISK_WRITE_THROUGH": "removed; the pinned engine writes completed entries through",
     "TF_DSV41_NEEDS_MODEL": "the pinned engine plans widths from the pack itself",
+    "TF_DSV41_RUNNER_SPEC_HOLD": "removed; the shared runner keeps no speculation across a fire",
     "GLM53_TF_ROCE_MAX_KB": "use TF_TP_MAILBOX_MAX_KB",
     "GLM53_TF_ROCE_FAST": "use TF_TP_ROCE_FAST",
 }

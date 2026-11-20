@@ -41,9 +41,9 @@ host tests. With the stack stopped:
 
 `./stack fetch` exports the pinned native engine and the asset-generator references. The seven older
 runtime patches in [patches](../patches) are archived under `legacy_patches` and are not applied.
-The two reviewed engine patches in [patches/engine](../patches/engine) are applied after export; each is
-checked against its pinned SHA-256 and the assembled tree must match the `tree` value in
-[sources.lock.json](../sources.lock.json).
+The reviewed engine series in [patches/engine](../patches/engine) is applied after a Git checkout at the
+pin with `git am`; each patch is checked against its pinned SHA-256, the series must give the pinned
+Git tree, and the assembled content must match `tree` in [sources.lock.json](../sources.lock.json).
 The three Python patches for the TensorFold reference are read from the commit recorded
 under `python_patches` in [sources.lock.json](../sources.lock.json), because upstream removed `patches/` from its
 own tree; each file is checked against its pinned SHA-256 before it is applied. A supplied `--source-cache` is

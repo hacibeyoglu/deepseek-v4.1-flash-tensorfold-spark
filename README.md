@@ -62,22 +62,25 @@ Portable model settings live in [recipes](recipes); local paths and topology liv
 live in ignored `.stack/`. Downloads check file sizes by default; use `./stack verify-weights`
 for explicit checksum verification.
 
-`./stack fetch` exports the pinned native engine, applies the two reviewed engine patches in
-[patches/engine](patches/engine), and exports the asset-generator references. It then applies the three
-Python patches for the TensorFold reference. The seven older runtime patches in [patches](patches) are
-retained as `legacy_patches` and are not applied. Upstream removed the Python patches from its own tree,
+`./stack fetch` checks out the pinned native engine and applies the reviewed engine patch series in
+[patches/engine](patches/engine) with `git am`, then exports the asset-generator references. It then applies
+the three Python patches for the TensorFold reference. The seven older runtime patches in [patches](patches)
+are retained as `legacy_patches` and are not applied. Upstream removed the Python patches from its own tree,
 so they are read from the commit recorded under `python_patches` in [sources.lock.json](sources.lock.json)
-and each file is checked against its SHA-256 before it is applied. Engine patches are hash-checked and the
-assembled tree must match the lock. See [source provenance](docs/SOURCES.md).
+and each file is checked against its SHA-256 before it is applied. Every engine patch is hash-checked, the
+series must reproduce upstream's engine tree, and the assembled content must match the lock. See
+[source provenance](docs/SOURCES.md).
 
 The default profile uses four slots, 1,048,576 context per request, a shared 2.1M-token KV pool,
 FP8 index KV, DSpark, native images and SSD session reuse. These are configured capacities;
 see [validation limits](docs/VALIDATION.md) for tested workloads.
 
-The native engine pin includes upstream's NVMe session-restore fix, session checkpoint fixes and
-undeclared tool-call passthrough. Reviewed engine patches make identical short prompts repeat under
-replay prefill and close the reasoning-only runner trace at the think close. Computation stays **off**
-in the existing recipes. The optional `flash17-jay-exl3-2.8bpw-compute` recipe adopts upstream's
+The native engine is upstream TensorFold `f212eeabd` plus the reviewed 91-patch series that reproduces
+the engine upstream serves: the shared compute lane and in-thinking runner, NVMe session restore,
+session checkpoints and undeclared tool-call passthrough, the Qwen lane fixes (`0073`-`0087`), DSpark
+staging alignment (`0088`), the optional adaptive context window (`0089`), replay-prefill short-prompt
+repetition (`0090`) and the reasoning-only trace close (`0091`). Computation stays **off** in the
+existing recipes. The optional `flash17-jay-exl3-2.8bpw-compute` recipe adopts upstream's
 experimental in-thinking compute profile. It can execute built-in Python calls and runner cells inside
 the engine; see [compute behavior and limits](docs/COMPUTE.md) before selecting it.
 

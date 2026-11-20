@@ -505,6 +505,9 @@ class SourceTests(unittest.TestCase):
                     (destination / "engine").mkdir()
                     (destination / "engine/file").write_text("old\n")
                 else: (destination / "reference.py").write_text("pass\n")
+            def fake_engine_export(spec, destination, cache=None):
+                destination.mkdir()
+                (destination / "native.zig").write_text("old\n")
             def fake_patches(root, lock, destination, cache=None):
                 destination.mkdir(parents=True)
                 (destination / "reference.patch").write_text(
@@ -512,13 +515,14 @@ class SourceTests(unittest.TestCase):
                 return destination
             def quiet_run(args, **kwargs):
                 subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
-            with patch("lib.sources.export", side_effect=fake_export), patch("lib.sources.python_patches", side_effect=fake_patches), patch("lib.sources.run", side_effect=quiet_run):
+            with patch("lib.sources.export", side_effect=fake_export), patch("lib.sources.export_engine", side_effect=fake_engine_export), patch("lib.sources.python_patches", side_effect=fake_patches), patch("lib.sources.run", side_effect=quiet_run):
                 sources.fetch(root)
                 self.assertEqual((root / ".stack/engine/native.zig").read_text(), "patched\n")
                 self.assertEqual((root / ".stack/source/engine/file").read_text(), "combined\n")
                 self.assertEqual((root / ".stack/python-source/reference.py").read_text(), "patched\n")
                 sources.verify(root)
-                with patch("lib.sources.export", side_effect=AssertionError("unexpected refetch")):
+                with patch("lib.sources.export", side_effect=AssertionError("unexpected refetch")), \
+                     patch("lib.sources.export_engine", side_effect=AssertionError("unexpected refetch")):
                     sources.fetch(root)
                 (root / ".stack/source/engine/file").write_text("user edit\n")
                 with self.assertRaisesRegex(StackError, "local changes"): sources.fetch(root)
@@ -604,6 +608,41 @@ class SourceTests(unittest.TestCase):
                 sources.apply_engine_patches(root, spec, third)
             spec["patches"][str(patch_path.relative_to(root))] = "0" * 64
             with self.assertRaisesRegex(StackError, "changed"):
+                sources.apply_engine_patches(root, spec, third)
+
+    def test_engine_series_applies_with_git_am_and_checks_git_tree(self):
+        """A checkout gets mail patches through git am, then both trees are checked."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "patches/engine").mkdir(parents=True)
+            patch_text = ("From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+                          "From: Fixture <fixture@invalid>\nDate: Mon, 1 Jan 2026 00:00:00 +0000\n"
+                          "Subject: [PATCH 1/1] fixture engine\n\n---\n"
+                          "diff --git a/native.zig b/native.zig\n--- a/native.zig\n+++ b/native.zig\n"
+                          "@@ -1 +1 @@\n-old\n+patched\n")
+            patch_path = root / "patches/engine/0001-fixture.patch"
+            patch_path.write_text(patch_text)
+            spec = {"patches": {str(patch_path.relative_to(root)): hashlib.sha256(patch_text.encode()).hexdigest()}}
+            def base(name):
+                repo = root / name
+                repo.mkdir()
+                subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+                (repo / "native.zig").write_text("old\n")
+                subprocess.run(["git", "-C", str(repo), "add", "native.zig"], check=True)
+                subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                                "commit", "--quiet", "-m", "base"], check=True)
+                return repo
+            first = base("first")
+            sources.apply_engine_patches(root, spec, first)
+            self.assertEqual((first / "native.zig").read_text(), "patched\n")
+            spec["git_tree"] = subprocess.check_output(
+                ["git", "-C", str(first), "rev-parse", "HEAD^{tree}"], text=True).strip()
+            second = base("second")
+            sources.apply_engine_patches(root, spec, second)
+            self.assertEqual((second / "native.zig").read_text(), "patched\n")
+            spec["git_tree"] = "0" * 40
+            third = base("third")
+            with self.assertRaisesRegex(StackError, "git tree"):
                 sources.apply_engine_patches(root, spec, third)
 
     def test_runtime_id_tracks_patch_changes(self):
